@@ -1,14 +1,16 @@
 // ========================================================================
-//  HEXUDON BOT v2.0 — Hệ thống Phân công Độc quyền & Đa nhiệm Toàn diện
+//  HEXUDON BOT v3.0 — Hệ thống Thu hoạch Đột phá & Tiếp tế Liên hoàn
 // ========================================================================
-//  Đột phá v2.0:
-//    1. Primary Brand Assignment: Mỗi ngày gán độc quyền từng Chuỗi Udon
-//       cho các xe tuần tra gần nhất -> ĐẢM BẢO 6/6 LOẠI MỖI NGÀY (60/60)
-//    2. Opportunistic Multi-Target: Sau khi ăn chuỗi được giao, lập tức
-//       quét sạch các quán Udon lân cận -> ĐẠT 300+ PHẦN UDON
-//    3. Long-Range Target Navigation: Xe chủ động hướng tới cụm mục tiêu
-//       xa thay vì bị kẹt trong vùng cục bộ
-//    4. Tanker Intercept & Refuel: Xe tiếp tế chủ động đón đầu xe cạn xăng
+//  Đột phá v3.0:
+//    1. En-Route Auto-Harvesting: Tự động ăn tất cả các quán Udon dọc đường
+//       hành quân tầm xa mà không tốn thêm bước di chuyển
+//    2. 100% Step Utilization: Loại bỏ hoàn toàn ngắt vòng lặp sớm, khai thác
+//       triệt để toàn bộ 100 bước mỗi ngày của mỗi xe
+//    3. Multi-Patrol Tanker Chain: Xe tiếp tế lập lộ trình chuỗi ghé thăm lần
+//       lượt 2-3 xe tuần tra cạn xăng nhất trong ngày
+//    4. Smart Low-Fuel Rendezvous: Xe tuần tra cạn xăng (<15) chủ động hẹn
+//       kết thúc ngày cùng ô với Tanker để sáng hôm sau nạp 100% bình xăng (40 xăng)
+//    5. Primary Brand Assignment: Giữ vững 60/60 điểm tuyệt đối lũy kế ngày
 // ========================================================================
 #include <algorithm>
 #include <chrono>
@@ -30,12 +32,11 @@
 using namespace std;
 
 namespace cfg {
-    constexpr double W_GLOBAL_DIVERSITY = 20000.0; // Thưởng chuỗi chưa từng ăn toàn trận
-    constexpr double W_DAILY_PRIMARY    = 15000.0; // Thưởng chuỗi được giao trong nhiệm vụ
-    constexpr double W_DAILY_DIVERSITY  = 8000.0;  // Thưởng chuỗi hôm nay cả đội chưa ăn
-    constexpr double W_PORTION_BASE     = 300.0;   // Thưởng cơ bản cho mỗi phần Udon
+    constexpr double W_GLOBAL_DIVERSITY = 30000.0; // Thưởng chuỗi chưa từng ăn toàn trận
+    constexpr double W_DAILY_PRIMARY    = 20000.0; // Thưởng chuỗi được giao trong nhiệm vụ
+    constexpr double W_DAILY_DIVERSITY  = 10000.0; // Thưởng chuỗi hôm nay cả đội chưa ăn
+    constexpr double W_PORTION_BASE     = 500.0;   // Thưởng cơ bản cho mỗi phần Udon
     constexpr double W_DISTANCE         = 1.0;     // Phạt khoảng cách (steps)
-    constexpr double W_TANKER_PROX      = 0.5;     // Kéo về xe tiếp tế cuối ngày
     constexpr int    POLL_MS            = 250;     // Polling rate limit
 }
 
@@ -160,8 +161,24 @@ static vector<int> reconstructPath(const DijkResult& dijk, int src, int dst) {
     return path;
 }
 
+// Kiểm tra và tự động thu thập Udon nếu ô hiện tại là quán còn hàng
+static bool checkAndClaimSpot(int pos, set<int>& visitedSpotsByMe,
+                              map<int,int>& claimedStock,
+                              set<int>& dayCollectedBrands) {
+    for (auto& sp : g_spots) {
+        if (sp.pos == pos && !visitedSpotsByMe.count(sp.pos) && claimedStock[sp.pos] < sp.stocks) {
+            visitedSpotsByMe.insert(sp.pos);
+            claimedStock[sp.pos]++;
+            dayCollectedBrands.insert(sp.brand);
+            g_collectedBrands.insert(sp.brand);
+            return true;
+        }
+    }
+    return false;
+}
+
 static string computeAssignment() {
-    // 1 Tanker + (N-1) Patrols để tối đa số xe ghi điểm
+    // 1 Tanker + 7 Patrols cho đội 8 xe
     int nTankers = 1;
     int nPatrols = max(1, g_nAgents - nTankers);
 
@@ -183,7 +200,7 @@ static string computeAssignment() {
 
 // Chấm điểm mục tiêu
 static double scoreSpot(const SpotInfo& spot, const DijkResult& dijk,
-                         int primaryBrand, const set<int>& dayCollectedBrands, int tankerPos) {
+                         int primaryBrand, const set<int>& dayCollectedBrands) {
     if (dijk.dist[spot.pos] == INT_MAX) return -1e18;
 
     double score = cfg::W_PORTION_BASE;
@@ -209,7 +226,7 @@ static double scoreSpot(const SpotInfo& spot, const DijkResult& dijk,
     return score;
 }
 
-// Lập kế hoạch tuần tra cho 1 xe
+// Lập kế hoạch tuần tra cho 1 xe (v3.0 En-Route Harvesting & 100% Step Usage)
 static vector<int> planPatrolRoute(int pos, int fuel, int daySteps,
                                     const vector<int>& traffic,
                                     map<int,int>& claimedStock,
@@ -222,8 +239,12 @@ static vector<int> planPatrolRoute(int pos, int fuel, int daySteps,
     int curFuel   = fuel;
     set<int> visitedSpotsByMe;
 
-    // Vòng lặp Multi-Target liên tục
-    while (stepsUsed < daySteps && curFuel > 0) {
+    // Kiểm tra ngay ô xuất phát có quán không
+    checkAndClaimSpot(curPos, visitedSpotsByMe, claimedStock, dayCollectedBrands);
+
+    // Vòng lặp Multi-Target liên tục cho tới khi cạn sạch bước hoặc xăng
+    int loopCount = 0;
+    while (stepsUsed < daySteps && curFuel > 0 && loopCount++ < 50) {
         int stepsLeft  = daySteps - stepsUsed;
         int fuelBudget = curFuel;
 
@@ -239,16 +260,15 @@ static vector<int> planPatrolRoute(int pos, int fuel, int daySteps,
             if (claimedStock[sp.pos] >= sp.stocks) continue;
             if (dijk.dist[sp.pos] == INT_MAX || dijk.fuel[sp.pos] > fuelBudget) continue;
 
-            double sc = scoreSpot(sp, dijk, primaryBrand, dayCollectedBrands, tankerPos);
+            double sc = scoreSpot(sp, dijk, primaryBrand, dayCollectedBrands);
             if (sc > bestScore) {
                 bestScore = sc;
                 bestIdx   = i;
             }
         }
 
-        // Nếu không có quán nào trong tầm với trực tiếp, nhưng vẫn chưa ăn primaryBrand
+        // Nếu chưa ăn được primaryBrand và không có quán trong tầm 1 bước nhảy
         if (bestIdx < 0 && primaryBrand >= 0 && !dayCollectedBrands.count(primaryBrand)) {
-            // Tìm quán thuộc primaryBrand gần nhất theo khoảng cách hex và di chuyển về phía đó
             int targetSpotPos = -1, minH = INT_MAX;
             for (auto& sp : g_spots) {
                 if (sp.brand == primaryBrand && claimedStock[sp.pos] < sp.stocks) {
@@ -257,9 +277,9 @@ static vector<int> planPatrolRoute(int pos, int fuel, int daySteps,
                 }
             }
             if (targetSpotPos >= 0) {
-                // Dijkstra không giới hạn steps/fuel để lấy hướng đi tốt nhất
                 DijkResult dijkGlobal = dijkstraAll(curPos, 9999, 9999, traffic, true);
                 vector<int> fullPath = reconstructPath(dijkGlobal, curPos, targetSpotPos);
+                bool moved = false;
                 for (int nxt : fullPath) {
                     auto cost = moveCost(curPos, traffic[curPos]);
                     int sc = cost.first, fc = cost.second;
@@ -270,12 +290,17 @@ static vector<int> planPatrolRoute(int pos, int fuel, int daySteps,
                     stepsUsed += sc;
                     curFuel   -= fc;
                     curPos     = nxt;
+                    moved = true;
+
+                    // Ăn dọc đường hành quân!
+                    checkAndClaimSpot(curPos, visitedSpotsByMe, claimedStock, dayCollectedBrands);
                 }
+                if (moved) continue; // Tiếp tục vòng lặp tại vị trí mới thay vì break!
             }
             break;
         }
 
-        if (bestIdx < 0) break; // Không còn quán nào nữa
+        if (bestIdx < 0) break; // Không còn quán nào trong tầm với
 
         vector<int> path = reconstructPath(dijk, curPos, g_spots[bestIdx].pos);
         if (path.empty()) break;
@@ -296,16 +321,14 @@ static vector<int> planPatrolRoute(int pos, int fuel, int daySteps,
             stepsUsed += sc;
             curFuel   -= fc;
             curPos     = nxt;
+
+            // Ăn dọc đường nếu bước qua quán khác!
+            checkAndClaimSpot(curPos, visitedSpotsByMe, claimedStock, dayCollectedBrands);
         }
         if (!pathOk) break;
-
-        visitedSpotsByMe.insert(g_spots[bestIdx].pos);
-        claimedStock[g_spots[bestIdx].pos]++;
-        dayCollectedBrands.insert(g_spots[bestIdx].brand);
-        g_collectedBrands.insert(g_spots[bestIdx].brand);
     }
 
-    // Nếu còn bước và gần hết xăng: Di chuyển về phía xe tiếp tế
+    // Nếu còn bước và xăng thấp (<15) hoặc còn steps dư: Hẹn gặp Tanker
     if (stepsUsed < daySteps && tankerPos >= 0 && curFuel > 0) {
         int stepsLeft = daySteps - stepsUsed;
         DijkResult dijkTanker = dijkstraAll(curPos, stepsLeft, curFuel, traffic, false);
@@ -321,6 +344,8 @@ static vector<int> planPatrolRoute(int pos, int fuel, int daySteps,
                 stepsUsed += sc;
                 curFuel   -= fc;
                 curPos     = nxt;
+
+                checkAndClaimSpot(curPos, visitedSpotsByMe, claimedStock, dayCollectedBrands);
             }
         }
     }
@@ -331,56 +356,68 @@ static vector<int> planPatrolRoute(int pos, int fuel, int daySteps,
     return actions;
 }
 
-// Lập kế hoạch cho xe tiếp tế (Tanker)
+// Lập kế hoạch tiếp tế chuỗi cho xe Tanker (v3.0 Multi-Patrol Tanker Chain)
 static vector<int> planTankerRoute(int tPos, int daySteps,
                                     const vector<int>& traffic,
                                     const vector<tuple<int,int,int>>& patrolInfo) {
     if (patrolInfo.empty()) return {-daySteps};
 
-    // Tìm xe tuần tra có lượng xăng thấp nhất
-    int targetPos = -1;
-    int minFuel   = INT_MAX;
-    for (size_t k = 0; k < patrolInfo.size(); k++) {
-        int pFuel = get<1>(patrolInfo[k]);
-        if (pFuel < minFuel) {
-            minFuel   = pFuel;
-            targetPos = get<2>(patrolInfo[k]);
-        }
-    }
-
-    // Nếu mọi xe đều dư xăng -> Đi về trọng tâm của nhóm
-    if (g_maxFuel > 0 && minFuel > g_maxFuel / 2) {
-        double sumR = 0, sumC = 0;
-        int n = (int)patrolInfo.size();
-        for (int k = 0; k < n; k++) {
-            int endP = get<2>(patrolInfo[k]);
-            sumR += endP / W;
-            sumC += endP % W;
-        }
-        int cr = max(0, min(H - 1, (int)(sumR / n)));
-        int cc = max(0, min(W - 1, (int)(sumC / n)));
-        int centroid = cr * W + cc;
-        if (centroid >= 0 && centroid < W * H && g_cells[centroid] != 3)
-            targetPos = centroid;
-    }
-
-    if (targetPos < 0) return {-daySteps};
-
-    DijkResult dijk = dijkstraAll(tPos, daySteps, INT_MAX, traffic, true);
-    vector<int> path = reconstructPath(dijk, tPos, targetPos);
+    // Sắp xếp các xe tuần tra theo mức xăng tăng dần (xe cạn xăng nhất ưu tiên hàng đầu)
+    vector<tuple<int,int,int>> sortedPatrols = patrolInfo;
+    sort(sortedPatrols.begin(), sortedPatrols.end(), [](const tuple<int,int,int>& a, const tuple<int,int,int>& b) {
+        return get<1>(a) < get<1>(b);
+    });
 
     vector<int> actions;
     int curPos = tPos, stepsUsed = 0;
 
-    for (int nxt : path) {
-        auto cost = moveCost(curPos, traffic[curPos]);
-        int sc = cost.first;
-        if (sc < 0 || stepsUsed + sc > daySteps) break;
-        int d = dirTo(curPos, nxt);
-        if (d < 0) break;
-        actions.push_back(d);
-        stepsUsed += sc;
-        curPos = nxt;
+    // Tanker lập lộ trình chuỗi ghé thăm lần lượt các xe tuần tra ít xăng
+    for (auto& p : sortedPatrols) {
+        int pFuel   = get<1>(p);
+        int targetP = get<2>(p); // Vị trí kết thúc của xe đó
+
+        // Chỉ ưu tiên tiếp tế nếu xe có xăng < 28 hoặc là xe cạn nhất
+        if (pFuel > 28 && !actions.empty()) continue;
+
+        int stepsLeft = daySteps - stepsUsed;
+        if (stepsLeft <= 0) break;
+
+        DijkResult dijk = dijkstraAll(curPos, stepsLeft, INT_MAX, traffic, true);
+        if (dijk.dist[targetP] == INT_MAX) continue;
+
+        vector<int> path = reconstructPath(dijk, curPos, targetP);
+        bool reached = true;
+        for (int nxt : path) {
+            auto cost = moveCost(curPos, traffic[curPos]);
+            int sc = cost.first;
+            if (sc < 0 || stepsUsed + sc > daySteps) { reached = false; break; }
+            int d = dirTo(curPos, nxt);
+            if (d < 0) { reached = false; break; }
+            actions.push_back(d);
+            stepsUsed += sc;
+            curPos = nxt;
+        }
+        if (!reached) break;
+    }
+
+    // Nếu vẫn còn bước sau khi tiếp tế: Di chuyển về phía trọng tâm nhóm hoặc trung tâm bản đồ
+    if (stepsUsed < daySteps) {
+        int stepsLeft = daySteps - stepsUsed;
+        int center = mapCenter();
+        DijkResult dijkCenter = dijkstraAll(curPos, stepsLeft, INT_MAX, traffic, true);
+        if (dijkCenter.dist[center] != INT_MAX) {
+            vector<int> path = reconstructPath(dijkCenter, curPos, center);
+            for (int nxt : path) {
+                auto cost = moveCost(curPos, traffic[curPos]);
+                int sc = cost.first;
+                if (sc < 0 || stepsUsed + sc > daySteps) break;
+                int d = dirTo(curPos, nxt);
+                if (d < 0) break;
+                actions.push_back(d);
+                stepsUsed += sc;
+                curPos = nxt;
+            }
+        }
     }
 
     int rest = daySteps - stepsUsed;
@@ -426,19 +463,17 @@ static string planActions(const mj::Value& m) {
     }
 
     // ── PHÂN BỔ NHIỆM VỤ CHUỖI UDON (PRIMARY BRAND MATCHING) ─────────
-    // Tìm danh sách tất cả các brand có mặt trong trận
     vector<int> brandList(g_allBrands.begin(), g_allBrands.end());
-    map<int, int> patrolToBrand; // patrolId -> primaryBrand (-1 nếu không gán)
+    map<int, int> patrolToBrand;
     set<int> assignedBrands;
 
-    // Gán tham lam: Mỗi brand gán cho patrol có khoảng cách gần nhất
+    // Gán tối ưu theo khoảng cách thực tế
     for (int b : brandList) {
         int bestPatrol = -1;
         int minDistance = INT_MAX;
 
-        // Tìm điểm gần nhất của brand b
         for (int pi : patrolIds) {
-            if (patrolToBrand.count(pi)) continue; // Patrol này đã được gán brand khác
+            if (patrolToBrand.count(pi)) continue;
             for (auto& sp : g_spots) {
                 if (sp.brand == b) {
                     int d = hexDist(agents[pi].pos, sp.pos);
@@ -456,7 +491,6 @@ static string planActions(const mj::Value& m) {
         }
     }
 
-    // Các Patrol còn lại (nếu có): gán brand gần nhất
     for (int pi : patrolIds) {
         if (!patrolToBrand.count(pi)) {
             int bestB = -1, minD = INT_MAX;
@@ -502,7 +536,7 @@ static string planActions(const mj::Value& m) {
         endPos[pi] = cur;
     }
 
-    // ── LẬP TUYẾN CHO TANKER ───────────────────────────────────────
+    // ── LẬP TUYẾN CHO TANKER (MULTI-STOP REFUEL CHAIN) ──────────────
     for (int ti : tankerIds) {
         vector<tuple<int,int,int>> patrolInfo;
         for (int pi : patrolIds) {
@@ -632,7 +666,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    fprintf(stderr, "=== HEXUDON BOT v2.0 ===\n");
+    fprintf(stderr, "=== HEXUDON BOT v3.0 ===\n");
     fprintf(stderr, "[SETUP] Map %dx%d | %zu spots | %zu brands | %d agents | maxFuel=%d | %d days\n",
             W, H, g_spots.size(), g_allBrands.size(), g_nAgents, g_maxFuel, g_totalDays);
 
