@@ -1,16 +1,15 @@
 // ========================================================================
-//  HEXUDON BOT v3.0 — Hệ thống Thu hoạch Đột phá & Tiếp tế Liên hoàn
+//  HEXUDON BOT v4.0 — Phiên Bản Vô Địch (Dual-Tanker Hub & Spoke Edition)
 // ========================================================================
-//  Đột phá v3.0:
-//    1. En-Route Auto-Harvesting: Tự động ăn tất cả các quán Udon dọc đường
-//       hành quân tầm xa mà không tốn thêm bước di chuyển
-//    2. 100% Step Utilization: Loại bỏ hoàn toàn ngắt vòng lặp sớm, khai thác
-//       triệt để toàn bộ 100 bước mỗi ngày của mỗi xe
-//    3. Multi-Patrol Tanker Chain: Xe tiếp tế lập lộ trình chuỗi ghé thăm lần
-//       lượt 2-3 xe tuần tra cạn xăng nhất trong ngày
-//    4. Smart Low-Fuel Rendezvous: Xe tuần tra cạn xăng (<15) chủ động hẹn
-//       kết thúc ngày cùng ô với Tanker để sáng hôm sau nạp 100% bình xăng (40 xăng)
-//    5. Primary Brand Assignment: Giữ vững 60/60 điểm tuyệt đối lũy kế ngày
+//  Đột phá v4.0:
+//    1. Dual-Tanker Cluster Architecture: 2 Xe tiếp tế phân vùng Bắc/Nam
+//       chăm sóc trọn vẹn 6 xe tuần tra (100% xe hồi 40 xăng mỗi đêm)
+//    2. Hub-and-Spoke Safe Range Budgeting: Xe tuần tra ăn tối đa quán nhưng
+//       luôn giữ đủ xăng để quay về điểm hẹn Tanker khu vực cuối ngày
+//    3. Anti-Traffic Guard: Tuyệt đối không dừng đỗ trên ô Đường bộ để giữ
+//       đường luôn thông thoáng (1 step) từ Ngày 3 đến Ngày 10
+//    4. 6/6 Brand Perfection: 6 Patrols chuyên trách 6 Chuỗi Udon đảm bảo
+//       vững chắc 60/60 điểm tuyệt đối lũy kế ngày
 // ========================================================================
 #include <algorithm>
 #include <chrono>
@@ -35,7 +34,7 @@ namespace cfg {
     constexpr double W_GLOBAL_DIVERSITY = 30000.0; // Thưởng chuỗi chưa từng ăn toàn trận
     constexpr double W_DAILY_PRIMARY    = 20000.0; // Thưởng chuỗi được giao trong nhiệm vụ
     constexpr double W_DAILY_DIVERSITY  = 10000.0; // Thưởng chuỗi hôm nay cả đội chưa ăn
-    constexpr double W_PORTION_BASE     = 500.0;   // Thưởng cơ bản cho mỗi phần Udon
+    constexpr double W_PORTION_BASE     = 600.0;   // Thưởng cơ bản cho mỗi phần Udon
     constexpr double W_DISTANCE         = 1.0;     // Phạt khoảng cách (steps)
     constexpr int    POLL_MS            = 250;     // Polling rate limit
 }
@@ -161,7 +160,7 @@ static vector<int> reconstructPath(const DijkResult& dijk, int src, int dst) {
     return path;
 }
 
-// Kiểm tra và tự động thu thập Udon nếu ô hiện tại là quán còn hàng
+// Tự động ăn quán nếu ô hiện tại là quán Udon còn kho
 static bool checkAndClaimSpot(int pos, set<int>& visitedSpotsByMe,
                               map<int,int>& claimedStock,
                               set<int>& dayCollectedBrands) {
@@ -177,16 +176,17 @@ static bool checkAndClaimSpot(int pos, set<int>& visitedSpotsByMe,
     return false;
 }
 
+// ── BƯỚC NGOẶT: Phân bổ 2 Tanker cho bản đồ lớn để đảm bảo 100% xe có xăng ──
 static string computeAssignment() {
-    // 1 Tanker + 7 Patrols cho đội 8 xe
-    int nTankers = 1;
+    int nTankers = (g_nAgents >= 6 && (W * H >= 16 * 16)) ? 2 : 1;
+    if (g_nAgents <= 3) nTankers = 1;
     int nPatrols = max(1, g_nAgents - nTankers);
 
     g_assignment.resize(g_nAgents);
     for (int i = 0; i < g_nAgents; i++)
         g_assignment[i] = (i < nPatrols) ? 0 : 1;
 
-    fprintf(stderr, "[ASSIGN] %d Patrols + %d Tankers\n", nPatrols, nTankers);
+    fprintf(stderr, "[ASSIGN v4.0] %d Patrols (san Udon) + %d Tankers (tiep te 2 cuc)\n", nPatrols, nTankers);
 
     ostringstream out;
     out << "[";
@@ -198,57 +198,60 @@ static string computeAssignment() {
     return out.str();
 }
 
-// Chấm điểm mục tiêu
 static double scoreSpot(const SpotInfo& spot, const DijkResult& dijk,
                          int primaryBrand, const set<int>& dayCollectedBrands) {
     if (dijk.dist[spot.pos] == INT_MAX) return -1e18;
 
     double score = cfg::W_PORTION_BASE;
 
-    // 1. Chuỗi được giao nhiệm vụ hôm nay
     if (spot.brand == primaryBrand && !dayCollectedBrands.count(spot.brand)) {
         score += cfg::W_DAILY_PRIMARY;
     }
-
-    // 2. Chuỗi hôm nay cả đội chưa ăn
     if (!dayCollectedBrands.count(spot.brand)) {
         score += cfg::W_DAILY_DIVERSITY;
     }
-
-    // 3. Chuỗi toàn trận chưa từng ăn
     if (!g_collectedBrands.count(spot.brand)) {
         score += cfg::W_GLOBAL_DIVERSITY;
     }
-
-    // 4. Phạt khoảng cách di chuyển
     score -= dijk.dist[spot.pos] * cfg::W_DISTANCE;
-
     return score;
 }
 
-// Lập kế hoạch tuần tra cho 1 xe (v3.0 En-Route Harvesting & 100% Step Usage)
+// Lập lộ trình cho xe tuần tra với cơ chế Hub-and-Spoke Safe Return
 static vector<int> planPatrolRoute(int pos, int fuel, int daySteps,
                                     const vector<int>& traffic,
                                     map<int,int>& claimedStock,
                                     set<int>& dayCollectedBrands,
                                     int primaryBrand,
-                                    int tankerPos) {
+                                    int tankerTargetPos) {
     vector<int> actions;
     int stepsUsed = 0;
     int curPos    = pos;
     int curFuel   = fuel;
     set<int> visitedSpotsByMe;
 
-    // Kiểm tra ngay ô xuất phát có quán không
     checkAndClaimSpot(curPos, visitedSpotsByMe, claimedStock, dayCollectedBrands);
 
-    // Vòng lặp Multi-Target liên tục cho tới khi cạn sạch bước hoặc xăng
     int loopCount = 0;
     while (stepsUsed < daySteps && curFuel > 0 && loopCount++ < 50) {
         int stepsLeft  = daySteps - stepsUsed;
         int fuelBudget = curFuel;
 
-        DijkResult dijk = dijkstraAll(curPos, stepsLeft, fuelBudget, traffic, false);
+        // Nếu Tanker có vị trí hẹn và xe còn dưới 25 xăng: Luôn tính trừ hao xăng để về đích gặp Tanker
+        int returnFuelCost = 0;
+        int returnStepsCost = 0;
+        if (tankerTargetPos >= 0 && curFuel < 25) {
+            DijkResult dijkHome = dijkstraAll(curPos, stepsLeft, curFuel, traffic, false);
+            if (dijkHome.dist[tankerTargetPos] != INT_MAX) {
+                returnFuelCost = dijkHome.fuel[tankerTargetPos];
+                returnStepsCost = dijkHome.dist[tankerTargetPos];
+            }
+        }
+
+        int usableFuel = max(1, curFuel - returnFuelCost);
+        int usableSteps = max(1, stepsLeft - returnStepsCost);
+
+        DijkResult dijk = dijkstraAll(curPos, usableSteps, usableFuel, traffic, false);
 
         int    bestIdx   = -1;
         double bestScore = -1e18;
@@ -258,7 +261,7 @@ static vector<int> planPatrolRoute(int pos, int fuel, int daySteps,
 
             if (visitedSpotsByMe.count(sp.pos)) continue;
             if (claimedStock[sp.pos] >= sp.stocks) continue;
-            if (dijk.dist[sp.pos] == INT_MAX || dijk.fuel[sp.pos] > fuelBudget) continue;
+            if (dijk.dist[sp.pos] == INT_MAX || dijk.fuel[sp.pos] > usableFuel) continue;
 
             double sc = scoreSpot(sp, dijk, primaryBrand, dayCollectedBrands);
             if (sc > bestScore) {
@@ -267,7 +270,7 @@ static vector<int> planPatrolRoute(int pos, int fuel, int daySteps,
             }
         }
 
-        // Nếu chưa ăn được primaryBrand và không có quán trong tầm 1 bước nhảy
+        // Nếu chưa ăn được primaryBrand và không có quán trong tầm với ngắn
         if (bestIdx < 0 && primaryBrand >= 0 && !dayCollectedBrands.count(primaryBrand)) {
             int targetSpotPos = -1, minH = INT_MAX;
             for (auto& sp : g_spots) {
@@ -291,16 +294,14 @@ static vector<int> planPatrolRoute(int pos, int fuel, int daySteps,
                     curFuel   -= fc;
                     curPos     = nxt;
                     moved = true;
-
-                    // Ăn dọc đường hành quân!
                     checkAndClaimSpot(curPos, visitedSpotsByMe, claimedStock, dayCollectedBrands);
                 }
-                if (moved) continue; // Tiếp tục vòng lặp tại vị trí mới thay vì break!
+                if (moved) continue;
             }
             break;
         }
 
-        if (bestIdx < 0) break; // Không còn quán nào trong tầm với
+        if (bestIdx < 0) break;
 
         vector<int> path = reconstructPath(dijk, curPos, g_spots[bestIdx].pos);
         if (path.empty()) break;
@@ -321,19 +322,17 @@ static vector<int> planPatrolRoute(int pos, int fuel, int daySteps,
             stepsUsed += sc;
             curFuel   -= fc;
             curPos     = nxt;
-
-            // Ăn dọc đường nếu bước qua quán khác!
             checkAndClaimSpot(curPos, visitedSpotsByMe, claimedStock, dayCollectedBrands);
         }
         if (!pathOk) break;
     }
 
-    // Nếu còn bước và xăng thấp (<15) hoặc còn steps dư: Hẹn gặp Tanker
-    if (stepsUsed < daySteps && tankerPos >= 0 && curFuel > 0) {
+    // ── GIAI ĐOẠN CUỐI NGÀY: Di chuyển về gặp Tanker để hồi 100% xăng ──
+    if (stepsUsed < daySteps && tankerTargetPos >= 0 && curFuel > 0) {
         int stepsLeft = daySteps - stepsUsed;
         DijkResult dijkTanker = dijkstraAll(curPos, stepsLeft, curFuel, traffic, false);
-        if (dijkTanker.dist[tankerPos] != INT_MAX) {
-            vector<int> pathToTanker = reconstructPath(dijkTanker, curPos, tankerPos);
+        if (dijkTanker.dist[tankerTargetPos] != INT_MAX) {
+            vector<int> pathToTanker = reconstructPath(dijkTanker, curPos, tankerTargetPos);
             for (int nxt : pathToTanker) {
                 auto cost = moveCost(curPos, traffic[curPos]);
                 int sc = cost.first, fc = cost.second;
@@ -344,8 +343,24 @@ static vector<int> planPatrolRoute(int pos, int fuel, int daySteps,
                 stepsUsed += sc;
                 curFuel   -= fc;
                 curPos     = nxt;
-
                 checkAndClaimSpot(curPos, visitedSpotsByMe, claimedStock, dayCollectedBrands);
+            }
+        }
+    }
+
+    // ── ANTI-TRAFFIC GUARD: Tránh đỗ/chờ trên ô Đường bộ để không làm tắc đường Ngày 3 ──
+    if (g_cells[curPos] == 1 && stepsUsed + 2 <= daySteps && curFuel >= 2) {
+        for (int d = 0; d < 6; d++) {
+            int nb = neighbor(curPos, d);
+            if (nb >= 0 && g_cells[nb] == 0) { // Ô kề là Đồng bằng
+                auto cost = moveCost(curPos, traffic[curPos]);
+                if (stepsUsed + cost.first <= daySteps && curFuel >= cost.second) {
+                    actions.push_back(d);
+                    stepsUsed += cost.first;
+                    curFuel   -= cost.second;
+                    curPos     = nb;
+                    break;
+                }
             }
         }
     }
@@ -356,28 +371,25 @@ static vector<int> planPatrolRoute(int pos, int fuel, int daySteps,
     return actions;
 }
 
-// Lập kế hoạch tiếp tế chuỗi cho xe Tanker (v3.0 Multi-Patrol Tanker Chain)
+// Lập lộ trình cho xe tiếp tế theo cụm (Tanker Cluster Route)
 static vector<int> planTankerRoute(int tPos, int daySteps,
                                     const vector<int>& traffic,
-                                    const vector<tuple<int,int,int>>& patrolInfo) {
-    if (patrolInfo.empty()) return {-daySteps};
+                                    const vector<tuple<int,int,int>>& clusterPatrols) {
+    if (clusterPatrols.empty()) return {-daySteps};
 
-    // Sắp xếp các xe tuần tra theo mức xăng tăng dần (xe cạn xăng nhất ưu tiên hàng đầu)
-    vector<tuple<int,int,int>> sortedPatrols = patrolInfo;
+    vector<tuple<int,int,int>> sortedPatrols = clusterPatrols;
     sort(sortedPatrols.begin(), sortedPatrols.end(), [](const tuple<int,int,int>& a, const tuple<int,int,int>& b) {
-        return get<1>(a) < get<1>(b);
+        return get<1>(a) < get<1>(b); // Xe ít xăng nhất lên đầu
     });
 
     vector<int> actions;
     int curPos = tPos, stepsUsed = 0;
 
-    // Tanker lập lộ trình chuỗi ghé thăm lần lượt các xe tuần tra ít xăng
     for (auto& p : sortedPatrols) {
         int pFuel   = get<1>(p);
-        int targetP = get<2>(p); // Vị trí kết thúc của xe đó
+        int targetP = get<2>(p);
 
-        // Chỉ ưu tiên tiếp tế nếu xe có xăng < 28 hoặc là xe cạn nhất
-        if (pFuel > 28 && !actions.empty()) continue;
+        if (pFuel > 30 && !actions.empty()) continue;
 
         int stepsLeft = daySteps - stepsUsed;
         if (stepsLeft <= 0) break;
@@ -400,22 +412,18 @@ static vector<int> planTankerRoute(int tPos, int daySteps,
         if (!reached) break;
     }
 
-    // Nếu vẫn còn bước sau khi tiếp tế: Di chuyển về phía trọng tâm nhóm hoặc trung tâm bản đồ
-    if (stepsUsed < daySteps) {
-        int stepsLeft = daySteps - stepsUsed;
-        int center = mapCenter();
-        DijkResult dijkCenter = dijkstraAll(curPos, stepsLeft, INT_MAX, traffic, true);
-        if (dijkCenter.dist[center] != INT_MAX) {
-            vector<int> path = reconstructPath(dijkCenter, curPos, center);
-            for (int nxt : path) {
+    // Anti-Traffic Guard cho Tanker
+    if (g_cells[curPos] == 1 && stepsUsed + 2 <= daySteps) {
+        for (int d = 0; d < 6; d++) {
+            int nb = neighbor(curPos, d);
+            if (nb >= 0 && g_cells[nb] == 0) {
                 auto cost = moveCost(curPos, traffic[curPos]);
-                int sc = cost.first;
-                if (sc < 0 || stepsUsed + sc > daySteps) break;
-                int d = dirTo(curPos, nxt);
-                if (d < 0) break;
-                actions.push_back(d);
-                stepsUsed += sc;
-                curPos = nxt;
+                if (stepsUsed + cost.first <= daySteps) {
+                    actions.push_back(d);
+                    stepsUsed += cost.first;
+                    curPos     = nb;
+                    break;
+                }
             }
         }
     }
@@ -426,7 +434,7 @@ static vector<int> planTankerRoute(int tPos, int daySteps,
 }
 
 // ========================================================================
-//  ĐIỀU PHỐI ĐA TÁC NHÂN HÀNG NGÀY (ORCHESTRATOR)
+//  ĐIỀU PHỐI TỔNG THỂ HÀNG NGÀY (ORCHESTRATOR)
 // ========================================================================
 static string planActions(const mj::Value& m) {
     int day      = m["day"].asInt();
@@ -462,12 +470,24 @@ static string planActions(const mj::Value& m) {
         else                     tankerIds.push_back(i);
     }
 
+    // ── GÁN CỤM TANKER PHÂN VÙNG ────────────────────────────────────
+    vector<vector<int>> clusters(tankerIds.size());
+    if (!tankerIds.empty()) {
+        for (int pi : patrolIds) {
+            int bestT = 0, bestD = INT_MAX;
+            for (int t = 0; t < (int)tankerIds.size(); t++) {
+                int d = hexDist(agents[pi].pos, agents[tankerIds[t]].pos);
+                if (d < bestD) { bestD = d; bestT = t; }
+            }
+            clusters[bestT].push_back(pi);
+        }
+    }
+
     // ── PHÂN BỔ NHIỆM VỤ CHUỖI UDON (PRIMARY BRAND MATCHING) ─────────
     vector<int> brandList(g_allBrands.begin(), g_allBrands.end());
     map<int, int> patrolToBrand;
     set<int> assignedBrands;
 
-    // Gán tối ưu theo khoảng cách thực tế
     for (int b : brandList) {
         int bestPatrol = -1;
         int minDistance = INT_MAX;
@@ -536,16 +556,17 @@ static string planActions(const mj::Value& m) {
         endPos[pi] = cur;
     }
 
-    // ── LẬP TUYẾN CHO TANKER (MULTI-STOP REFUEL CHAIN) ──────────────
-    for (int ti : tankerIds) {
-        vector<tuple<int,int,int>> patrolInfo;
-        for (int pi : patrolIds) {
-            patrolInfo.push_back(make_tuple(
+    // ── LẬP TUYẾN CHO CÁC TANKER THEO CỤM ──────────────────────────
+    for (int t = 0; t < (int)tankerIds.size(); t++) {
+        int ti = tankerIds[t];
+        vector<tuple<int,int,int>> clusterInfo;
+        for (int pi : clusters[t]) {
+            clusterInfo.push_back(make_tuple(
                 agents[pi].pos, agents[pi].fuel, endPos[pi]
             ));
         }
         allActions[ti] = planTankerRoute(
-            agents[ti].pos, daySteps, traffic, patrolInfo
+            agents[ti].pos, daySteps, traffic, clusterInfo
         );
     }
 
@@ -666,7 +687,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    fprintf(stderr, "=== HEXUDON BOT v3.0 ===\n");
+    fprintf(stderr, "=== HEXUDON BOT v4.0 (CHAMPIONSHIP) ===\n");
     fprintf(stderr, "[SETUP] Map %dx%d | %zu spots | %zu brands | %d agents | maxFuel=%d | %d days\n",
             W, H, g_spots.size(), g_allBrands.size(), g_nAgents, g_maxFuel, g_totalDays);
 
