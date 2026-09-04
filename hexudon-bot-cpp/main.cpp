@@ -357,7 +357,7 @@ static TourSimulationResult simulateTourExact(int startPos, int startFuel, int m
     if (tour.empty()) return {true, 0, 0, {}, {}};
 
     int K = (int)tour.size();
-    int maxF = min(startFuel, 500);
+    int maxF = min(startFuel, 250);
 
     vector<vector<int>> dp(K + 1, vector<int>(maxF + 1, INT_MAX));
     vector<vector<int>> parentFuel(K + 1, vector<int>(maxF + 1, -1));
@@ -1008,6 +1008,11 @@ static string planActions(const mj::Value& m) {
     };
 
     for (;;) {
+        auto curNow = chrono::high_resolution_clock::now();
+        if (chrono::duration<double, milli>(curNow - startTime).count() > 1500.0) {
+            break; // Chrono Watchdog: Đảm bảo phản hồi luôn dưới 1.8 giây, an toàn tuyệt đối dưới mốc 15s của BTC!
+        }
+
         int bestPatrol = -1;
         int bestSpot = -1;
         LexicographicScore bestLexScore = {-1, -1, -1, -1e9, -1e9};
@@ -1066,49 +1071,72 @@ static string planActions(const mj::Value& m) {
 
                 bool isDynamicallyOwned = (dynamicVoronoiOwner[spotPos] == p);
 
-                for (size_t k = 0; k <= patrolTours[p].size(); k++) {
-                    vector<int> candidateTour = patrolTours[p];
-                    candidateTour.insert(candidateTour.begin() + k, spotPos);
+                // TÌM VỊ TRÍ CHÈN TỐI ƯU TRONG O(1) QUA BẢNG KHOẢNG CÁCH PARETO ĐÃ CÓ
+                int bestK = (int)patrolTours[p].size();
+                int minExtraDist = INT_MAX;
 
-                    auto fastCheckSim = simulateTourExact(startP, pFuel, pMaxSteps, candidateTour);
-                    if (!fastCheckSim.feasible) continue;
-
-                    if (candidateTour.size() > 2) {
-                        candidateTour = optimizeTour2OptExact(startP, pFuel, pMaxSteps, candidateTour);
+                if (patrolTours[p].empty()) {
+                    bestK = 0;
+                } else {
+                    for (size_t k = 0; k <= patrolTours[p].size(); k++) {
+                        int prevPos = (k == 0) ? startP : patrolTours[p][k - 1];
+                        int nextPos = (k == patrolTours[p].size()) ? -1 : patrolTours[p][k];
+                        int extra = fastDist(prevPos, spotPos);
+                        if (nextPos != -1) {
+                            extra += fastDist(spotPos, nextPos) - fastDist(prevPos, nextPos);
+                        }
+                        if (extra < minExtraDist) {
+                            minExtraDist = extra;
+                            bestK = (int)k;
+                        }
                     }
+                }
 
-                    auto candSim = simulateTourExact(startP, pFuel, pMaxSteps, candidateTour);
-                    if (!candSim.feasible) continue;
+                vector<int> candidateTour = patrolTours[p];
+                candidateTour.insert(candidateTour.begin() + bestK, spotPos);
 
-                    int deltaSteps = max(1, candSim.totalSteps - currentSim.totalSteps);
+                auto candSim = simulateTourExact(startP, pFuel, pMaxSteps, candidateTour);
+                if (!candSim.feasible) continue;
 
-                    LexicographicScore candScore;
-                    candScore.p1_newGlobalBrand = (!g_collectedBrands.count(spotBrand)) ? 1 : 0;
-                    candScore.p2_newDailyBrand  = (!teamPlannedBrands.count(spotBrand)) ? 1 : 0;
-                    candScore.p3_portions       = min(projectedStock[spotPos], 1);
-                    candScore.p4_efficiency     = 1000.0 / (double)deltaSteps;
+                int deltaSteps = max(1, candSim.totalSteps - currentSim.totalSteps);
 
-                    double strategic = 0.0;
-                    if (isDynamicallyOwned) strategic += 10.0;
-                    strategic += (projectedStock[spotPos] - 1) * 0.5;
+                LexicographicScore candScore;
+                candScore.p1_newGlobalBrand = (!g_collectedBrands.count(spotBrand)) ? 1 : 0;
+                candScore.p2_newDailyBrand  = (!teamPlannedBrands.count(spotBrand)) ? 1 : 0;
+                candScore.p3_portions       = min(projectedStock[spotPos], 1);
+                candScore.p4_efficiency     = 1000.0 / (double)deltaSteps;
 
-                    double projected = (double)currentTeamPortions + 1.0;
-                    if (projected < pacing.floor) {
-                        strategic += cfg::LAMBDA_LOW * (pacing.floor - projected);
-                    }
-                    candScore.p5_strategicPos = strategic;
+                double strategic = 0.0;
+                if (isDynamicallyOwned) strategic += 10.0;
+                strategic += (projectedStock[spotPos] - 1) * 0.5;
 
-                    if (bestPatrol < 0 || candScore > bestLexScore) {
-                        bestLexScore = candScore;
-                        bestPatrol = p;
-                        bestSpot = spotPos;
-                        bestTourCandidate = candidateTour;
-                    }
+                double projected = (double)currentTeamPortions + 1.0;
+                if (projected < pacing.floor) {
+                    strategic += cfg::LAMBDA_LOW * (pacing.floor - projected);
+                }
+                candScore.p5_strategicPos = strategic;
+
+                if (bestPatrol < 0 || candScore > bestLexScore) {
+                    bestLexScore = candScore;
+                    bestPatrol = p;
+                    bestSpot = spotPos;
+                    bestTourCandidate = candidateTour;
                 }
             }
         }
 
         if (bestPatrol < 0) break;
+
+        // CHỈ CHẠY 2-OPT EXACT DUY NHẤT 1 LẦN CHO TOUR THỰC SỰ ĐƯỢC CHỌN
+        int startP = startPositions[bestPatrol];
+        int pFuel  = agents[patrolIds[bestPatrol]].fuel;
+        bool startsOnSpot = false;
+        for (auto& sp : g_spots) if (sp.pos == startP) { startsOnSpot = true; break; }
+        int pMaxSteps = maxPatrolPhysicalSteps - (startsOnSpot ? 1 : 0);
+
+        if (bestTourCandidate.size() > 2) {
+            bestTourCandidate = optimizeTour2OptExact(startP, pFuel, pMaxSteps, bestTourCandidate);
+        }
 
         patrolTours[bestPatrol] = bestTourCandidate;
         projectedStock[bestSpot]--;
@@ -1360,7 +1388,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    fprintf(stderr, "=== HEXUDON BOT v72.0 (STATIONARY START-SPOT CLAIM & 60/60 CHAMPIONSHIP) ===\n");
+    fprintf(stderr, "=== HEXUDON BOT v73.0 (LIGHTNING-SPEED ENGINE & CHRONO WATCHDOG) ===\n");
     fprintf(stderr, "[SETUP] Map %dx%d | %zu spots | %zu brands | %d agents | maxFuel=%d | %d days\n",
             W, H, g_spots.size(), g_allBrands.size(), g_nAgents, g_maxFuel, g_totalDays);
 
