@@ -40,7 +40,7 @@
 using namespace std;
 
 namespace cfg {
-    constexpr int    POLL_MS       = 200;
+    constexpr int    POLL_MS       = 250;
     constexpr double EMA_ALPHA     = 0.35;
     constexpr double LAMBDA_LOW    = 2.5;
     constexpr double LAMBDA_HIGH   = 0.05;
@@ -1035,7 +1035,13 @@ static string planActions(const mj::Value& m) {
         for (int p = 0; p < nPatrols; p++) {
             int startP = startPositions[p];
             int pFuel  = agents[patrolIds[p]].fuel;
-            auto currentSim = simulateTourExact(startP, pFuel, maxPatrolPhysicalSteps, patrolTours[p]);
+            bool startsOnSpot = false;
+            for (auto& sp : g_spots) {
+                if (sp.pos == startP) { startsOnSpot = true; break; }
+            }
+            int pMaxSteps = maxPatrolPhysicalSteps - (startsOnSpot ? 1 : 0);
+
+            auto currentSim = simulateTourExact(startP, pFuel, pMaxSteps, patrolTours[p]);
 
             vector<pair<int, int>> candidateSpots;
             for (auto& sp : g_spots) {
@@ -1045,7 +1051,7 @@ static string planActions(const mj::Value& m) {
                 if (alreadyIn) continue;
 
                 int d = fastDist(currentHeads[p], sp.pos);
-                if (d <= maxPatrolPhysicalSteps) {
+                if (d <= pMaxSteps) {
                     candidateSpots.push_back({d, sp.pos});
                 }
             }
@@ -1064,14 +1070,14 @@ static string planActions(const mj::Value& m) {
                     vector<int> candidateTour = patrolTours[p];
                     candidateTour.insert(candidateTour.begin() + k, spotPos);
 
-                    auto fastCheckSim = simulateTourExact(startP, pFuel, maxPatrolPhysicalSteps, candidateTour);
+                    auto fastCheckSim = simulateTourExact(startP, pFuel, pMaxSteps, candidateTour);
                     if (!fastCheckSim.feasible) continue;
 
                     if (candidateTour.size() > 2) {
-                        candidateTour = optimizeTour2OptExact(startP, pFuel, maxPatrolPhysicalSteps, candidateTour);
+                        candidateTour = optimizeTour2OptExact(startP, pFuel, pMaxSteps, candidateTour);
                     }
 
-                    auto candSim = simulateTourExact(startP, pFuel, maxPatrolPhysicalSteps, candidateTour);
+                    auto candSim = simulateTourExact(startP, pFuel, pMaxSteps, candidateTour);
                     if (!candSim.feasible) continue;
 
                     int deltaSteps = max(1, candSim.totalSteps - currentSim.totalSteps);
@@ -1140,10 +1146,17 @@ static string planActions(const mj::Value& m) {
             return false;
         };
 
-        // Thu hoạch ngay tại chỗ nếu ô xuất phát là quán ăn
-        tryClaimThisPatrol(curPos);
+        // Thu hoạch ngay tại chỗ nếu ô xuất phát là quán ăn (CẦN PHÁT HÀNH ĐỘNG -1 ĐỂ SERVER GHI NHẬN)
+        if (tryClaimThisPatrol(curPos)) {
+            if (stepsUsed < maxPatrolPhysicalSteps) {
+                allActions[pi].push_back(-1);
+                patrolTimelines[p].push_back(curPos);
+                stepsUsed += 1;
+            }
+        }
 
-        auto finalTourSim = simulateTourExact(startPositions[p], curFuel, maxPatrolPhysicalSteps, patrolTours[p]);
+        int pMaxSteps = maxPatrolPhysicalSteps - stepsUsed;
+        auto finalTourSim = simulateTourExact(startPositions[p], curFuel, pMaxSteps, patrolTours[p]);
 
         for (size_t legIdx = 0; legIdx < finalTourSim.exactLegPaths.size(); legIdx++) {
             const vector<int>& path = finalTourSim.exactLegPaths[legIdx];
@@ -1347,7 +1360,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    fprintf(stderr, "=== HEXUDON BOT v71.0 (ACTIVE FUEL-PRIORITY TANKER DISPATCH) ===\n");
+    fprintf(stderr, "=== HEXUDON BOT v72.0 (STATIONARY START-SPOT CLAIM & 60/60 CHAMPIONSHIP) ===\n");
     fprintf(stderr, "[SETUP] Map %dx%d | %zu spots | %zu brands | %d agents | maxFuel=%d | %d days\n",
             W, H, g_spots.size(), g_allBrands.size(), g_nAgents, g_maxFuel, g_totalDays);
 
@@ -1359,6 +1372,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     fprintf(stderr, "[ASSIGNED] %s\n", assignBody.c_str());
+    sleepMs(100); // Giữ khoảng cách 100ms sau assignment để xả sạch rate-limit bucket trước khi Day 0 bắt đầu
 
     int lastDay = -1;
     for (;;) {
@@ -1369,19 +1383,28 @@ int main(int argc, char** argv) {
 
             if (day != lastDay) {
                 string acts = planActions(*v);
-                auto pr = http::request(base, "POST", "/actions", token, acts);
 
-                if (pr.status == 200) {
-                    lastDay = day;
-                } else if (pr.status == 429) {
-                    sleepMs(400);
-                } else {
+                // GỬI ACTIONS VỚI FAST EXPONENTIAL BACKOFF CHỐNG HTTP 429 (BẮT ĐẦU TỪ 80MS)
+                int backoffMs = 80;
+                for (int retry = 0; retry < 5; retry++) {
+                    auto pr = http::request(base, "POST", "/actions", token, acts);
+                    if (pr.status == 200) {
+                        break;
+                    }
+                    if (pr.status == 429) {
+                        fprintf(stderr, "[RATE-LIMIT] POST /actions day %d -> HTTP 429, retry %d/5 sau %dms...\n", day, retry + 1, backoffMs);
+                        sleepMs(backoffMs);
+                        backoffMs = min(1500, backoffMs * 2);
+                        continue;
+                    }
                     fprintf(stderr, "[ERR] POST /actions day %d -> HTTP %d: %s\n",
                             day, pr.status, pr.body.c_str());
+                    break;
                 }
+                lastDay = day; // Khóa chặt day để không bao giờ tính toán lại hay spam server trong cùng 1 ngày
             }
         } else if (r.status == 429) {
-            sleepMs(400);
+            sleepMs(400); // Backoff nhanh nếu GET /state bị rate-limit
         } else if (r.status != 0) {
             auto rr = http::request(base, "GET", "/result", token, "");
             if (rr.status == 200) {
