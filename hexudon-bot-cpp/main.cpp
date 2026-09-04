@@ -971,31 +971,9 @@ static string planActions(const mj::Value& m) {
             teamPlannedBrands.insert(g_spotBrands[spotPos]);
         }
     }
-
-    // Quét thêm cho các xe còn rảnh nếu còn brand chưa khóa
-    for (int b : brandList) {
-        if (!teamPlannedBrands.count(b)) {
-            int bestP = -1, bestSpot = -1, minD = INT_MAX;
-            for (int p = 0; p < nPatrols; p++) {
-                int startP = (patrolTours[p].empty()) ? startPositions[p] : patrolTours[p].back();
-                for (auto& sp : g_spots) {
-                    if (sp.brand == b && projectedStock[sp.pos] > 0) {
-                        int d = fastDist(startP, sp.pos);
-                        if (d < minD && d <= maxPatrolPhysicalSteps) {
-                            minD = d;
-                            bestP = p;
-                            bestSpot = sp.pos;
-                        }
-                    }
-                }
-            }
-            if (bestP >= 0 && bestSpot >= 0) {
-                patrolTours[bestP].push_back(bestSpot);
-                projectedStock[bestSpot]--;
-                teamPlannedBrands.insert(b);
-            }
-        }
-    }
+    // Phase 1 đã ghép Hungarian tối ưu 1 quán/xe có tính khả thi cao nhất.
+    // Toàn bộ các quán tiếp theo (multi-spot TSP packing) được ủy quyền cho Phase 2
+    // để kiểm tra nghiệm khả thi (simulateTourExact) nghiêm ngặt về cả Fuel & Steps.
 
     // ── PHASE 2: PURE LEXICOGRAPHIC PIPELINE WITH MULTI-SPOT TSP PACKING ───
     int currentTeamPortions = 0;
@@ -1388,7 +1366,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    fprintf(stderr, "=== HEXUDON BOT v73.0 (LIGHTNING-SPEED ENGINE & CHRONO WATCHDOG) ===\n");
+    fprintf(stderr, "=== HEXUDON BOT v74.0 (STRICT FEASIBILITY TSP PACKING & ROBUST DISPATCH) ===\n");
     fprintf(stderr, "[SETUP] Map %dx%d | %zu spots | %zu brands | %d agents | maxFuel=%d | %d days\n",
             W, H, g_spots.size(), g_allBrands.size(), g_nAgents, g_maxFuel, g_totalDays);
 
