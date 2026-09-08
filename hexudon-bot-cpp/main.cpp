@@ -25,6 +25,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <queue>
@@ -40,12 +42,12 @@
 using namespace std;
 
 namespace cfg {
-    constexpr int    POLL_MS       = 250;
-    constexpr double EMA_ALPHA     = 0.35;
-    constexpr double LAMBDA_LOW    = 2.5;
-    constexpr double LAMBDA_HIGH   = 0.05;
-    constexpr int    TOP_CANDIDATES = 25;
-    constexpr int    FUEL_SAFE_MARGIN = 60;
+    constexpr int    POLL_MS          = 215; // Tối ưu hóa chu kỳ Polling (>= 200ms an toàn theo quy định BTC)
+    constexpr double EMA_ALPHA        = 0.35;
+    constexpr double LAMBDA_LOW       = 2.5;
+    constexpr double LAMBDA_HIGH      = 0.05;
+    constexpr int    TOP_CANDIDATES   = 25;
+    constexpr double FUEL_SAFE_RATIO  = 0.35; // Ngưỡng an toàn xăng động (35% maxFuel)
 }
 
 struct SpotInfo {
@@ -504,6 +506,22 @@ static vector<int> hungarianMinCost(const vector<vector<int>>& costMatrix) {
 static vector<int> optimizeTour2OptExact(int startPos, int startFuel, int maxStepsLimit, const vector<int>& spotPositions) {
     if (spotPositions.size() <= 2) return spotPositions;
 
+    auto calcFirstArrivalScore = [&](const vector<int>& t) -> int {
+        int score = 0;
+        int K = (int)t.size();
+        for (int idx = 0; idx < K; idx++) {
+            int spot = t[idx];
+            int b = g_spotBrands[spot];
+            int weight = K - idx; // Càng ở đầu tour trọng số càng cao
+            if (!g_collectedBrands.count(b)) {
+                score += 100 * weight; // Brand chưa từng thu hoạch toàn trận
+            } else {
+                score += 10 * weight;
+            }
+        }
+        return score;
+    };
+
     vector<int> tour = spotPositions;
     bool improved = true;
     int maxIters = 12;
@@ -524,8 +542,15 @@ static vector<int> optimizeTour2OptExact(int startPos, int startFuel, int maxSte
                         isBetter = true;
                     } else if (newSim.totalSteps < currentSim.totalSteps) {
                         isBetter = true;
-                    } else if (newSim.totalSteps == currentSim.totalSteps && newSim.totalFuel < currentSim.totalFuel) {
-                        isBetter = true;
+                    } else if (newSim.totalSteps == currentSim.totalSteps) {
+                        if (newSim.totalFuel < currentSim.totalFuel) {
+                            isBetter = true;
+                        } else if (newSim.totalFuel == currentSim.totalFuel) {
+                            // TIE-BREAKER: Tối ưu hóa First-Arrival Time cho thương hiệu quý
+                            if (calcFirstArrivalScore(newTour) > calcFirstArrivalScore(tour)) {
+                                isBetter = true;
+                            }
+                        }
                     }
                 }
 
@@ -545,6 +570,7 @@ static vector<int> optimizeTour2OptExact(int startPos, int startFuel, int maxSte
 struct TimeWindowTankerSimResult {
     bool feasible;
     int finalStep;
+    int totalPatrolWait;
     vector<RendezvousEvent> optimizedSequence;
 };
 
@@ -553,52 +579,79 @@ static TimeWindowTankerSimResult simulateTankerTimeWindowTour(
     int daySteps,
     const vector<RendezvousEvent>& events) {
 
-    if (events.empty()) return {true, 0, {}};
+    if (events.empty()) return {true, 0, 0, {}};
 
-    // Sắp xếp các sự kiện ứng viên theo độ ưu tiên:
-    // 1. Xe có lượng xăng còn lại ít nhất lên đầu để cứu đói trước
-    // 2. Tie-break: Gần vị trí xe bồn hơn
+    // Sắp xếp các sự kiện ứng viên theo độ ưu tiên kết hợp:
+    // 1. Xe khẩn cấp lên đầu (isUrgent)
+    // 2. Xe có lượng xăng còn lại ít nhất (fuelBefore)
+    // 3. Slack deadline hẹp hơn (ít thời gian rảnh rỗi trước khi hết ngày)
+    // 4. Gần vị trí xe bồn hơn
     vector<RendezvousEvent> sortedEvents = events;
     sort(sortedEvents.begin(), sortedEvents.end(), [&](const RendezvousEvent& a, const RendezvousEvent& b) {
+        if (a.isUrgent != b.isUrgent) return a.isUrgent > b.isUrgent;
         if (a.fuelBefore != b.fuelBefore) return a.fuelBefore < b.fuelBefore;
-        return fastDist(tankerStartPos, a.pos) < fastDist(tankerStartPos, b.pos);
+        int distA = fastDist(tankerStartPos, a.pos);
+        int distB = fastDist(tankerStartPos, b.pos);
+        int slackA = (distA == INT_MAX) ? -1 : (daySteps - (distA + 1));
+        int slackB = (distB == INT_MAX) ? -1 : (daySteps - (distB + 1));
+        if (slackA != slackB) return slackA < slackB; // Slack hẹp hơn ưu tiên trước
+        return distA < distB;
     });
 
-    auto evaluateSeq = [&](const vector<RendezvousEvent>& s) -> pair<bool, int> {
+    struct SeqEval {
+        bool feasible;
+        int finishTime;
+        int patrolWait;
+        int cost;
+    };
+
+    auto evaluateSeq = [&](const vector<RendezvousEvent>& s) -> SeqEval {
         int curPos = tankerStartPos;
         int curTime = 0;
+        int totalPatrolWait = 0;
 
         for (const auto& ev : s) {
             int travel = fastDist(curPos, ev.pos);
-            if (travel == INT_MAX) return {false, INT_MAX};
+            if (travel == INT_MAX) return {false, INT_MAX, INT_MAX, INT_MAX};
 
             int tArrive = curTime + travel;
+            if (tArrive > ev.arrivalTime) {
+                totalPatrolWait += (tArrive - ev.arrivalTime); // Patrol bị bắt đứng chờ
+            }
             int tRefuel = max(tArrive, ev.arrivalTime);
             int tDepart = tRefuel + 1;
 
-            if (tDepart > daySteps) return {false, INT_MAX};
+            if (tDepart > daySteps) return {false, INT_MAX, INT_MAX, INT_MAX};
 
             curTime = tDepart;
             curPos  = ev.pos;
         }
-        return {true, curTime};
+        // HÀM MỤC TIÊU ZERO-WAIT: Ưu tiên tối đa việc Tanker đến trước hoặc cùng lúc Patrol (WAIT = 0)
+        int cost = curTime * 10 + totalPatrolWait * 25;
+        return {true, curTime, totalPatrolWait, cost};
     };
 
     vector<RendezvousEvent> currentTour;
     int currentFinishTime = 0;
+    int currentPatrolWait = 0;
+    int currentCost = INT_MAX;
 
-    // Chèn tham lam từng sự kiện theo thứ tự ưu tiên xăng
+    // Chèn tham lam từng sự kiện theo hàm chi phí Zero-Wait
     for (const auto& ev : sortedEvents) {
         int bestK = -1;
-        int minFinish = INT_MAX;
+        int minCost = INT_MAX;
+        int bestFinish = INT_MAX;
+        int bestWait = INT_MAX;
         vector<RendezvousEvent> bestCandTour;
 
         for (size_t k = 0; k <= currentTour.size(); k++) {
             vector<RendezvousEvent> candTour = currentTour;
             candTour.insert(candTour.begin() + k, ev);
             auto eval = evaluateSeq(candTour);
-            if (eval.first && eval.second < minFinish) {
-                minFinish = eval.second;
+            if (eval.feasible && eval.cost < minCost) {
+                minCost = eval.cost;
+                bestFinish = eval.finishTime;
+                bestWait = eval.patrolWait;
                 bestK = (int)k;
                 bestCandTour = candTour;
             }
@@ -606,11 +659,13 @@ static TimeWindowTankerSimResult simulateTankerTimeWindowTour(
 
         if (bestK >= 0) {
             currentTour = bestCandTour;
-            currentFinishTime = minFinish;
+            currentFinishTime = bestFinish;
+            currentPatrolWait = bestWait;
+            currentCost = minCost;
 
-            // 2-Opt tinh chỉnh thứ tự các điểm tiếp tế
+            // 2-Opt tinh chỉnh thứ tự các điểm tiếp tế triệt tiêu WAIT
             bool improved = true;
-            int iters = 10;
+            int iters = 12;
             while (improved && iters-- > 0) {
                 improved = false;
                 for (size_t i = 0; i < currentTour.size() - 1; i++) {
@@ -618,9 +673,11 @@ static TimeWindowTankerSimResult simulateTankerTimeWindowTour(
                         vector<RendezvousEvent> newTour = currentTour;
                         reverse(newTour.begin() + i, newTour.begin() + j + 1);
                         auto newEval = evaluateSeq(newTour);
-                        if (newEval.first && newEval.second < currentFinishTime) {
+                        if (newEval.feasible && newEval.cost < currentCost) {
                             currentTour = newTour;
-                            currentFinishTime = newEval.second;
+                            currentFinishTime = newEval.finishTime;
+                            currentPatrolWait = newEval.patrolWait;
+                            currentCost = newEval.cost;
                             improved = true;
                         }
                     }
@@ -629,7 +686,7 @@ static TimeWindowTankerSimResult simulateTankerTimeWindowTour(
         }
     }
 
-    return {true, currentFinishTime, currentTour};
+    return {true, currentFinishTime, currentPatrolWait, currentTour};
 }
 
 static vector<int> planSingleTankerRouteTimeWindow(
@@ -717,29 +774,82 @@ static BestMultiTankerPartition findOptimalTankerPartition(
     }
 
     int nEvents = (int)allEvents.size();
-    int totalPartitions = 1 << nEvents;
 
-    BestMultiTankerPartition bestRes = {false, INT_MAX, {}};
+    // Đối với 2 xe bồn: Vét cạn toàn bộ 2^nEvents phân hoạch để tìm min (Makespan + 2.5 * Wait)
+    if (nTankers == 2) {
+        int totalPartitions = 1 << nEvents;
+        BestMultiTankerPartition bestRes = {false, INT_MAX, {}};
+        int bestCost = INT_MAX;
 
-    for (int mask = 0; mask < totalPartitions; mask++) {
-        vector<vector<RendezvousEvent>> candidateClusters(2);
-        for (int i = 0; i < nEvents; i++) {
-            if ((mask >> i) & 1) candidateClusters[1].push_back(allEvents[i]);
-            else                 candidateClusters[0].push_back(allEvents[i]);
+        for (int mask = 0; mask < totalPartitions; mask++) {
+            vector<vector<RendezvousEvent>> candidateClusters(2);
+            for (int i = 0; i < nEvents; i++) {
+                if ((mask >> i) & 1) candidateClusters[1].push_back(allEvents[i]);
+                else                 candidateClusters[0].push_back(allEvents[i]);
+            }
+
+            auto sim0 = simulateTankerTimeWindowTour(tankerStartPositions[0], daySteps, candidateClusters[0]);
+            auto sim1 = simulateTankerTimeWindowTour(tankerStartPositions[1], daySteps, candidateClusters[1]);
+
+            int makespan = max(sim0.finalStep, sim1.finalStep);
+            int totalWait = sim0.totalPatrolWait + sim1.totalPatrolWait;
+            int partitionCost = makespan * 10 + totalWait * 25;
+
+            if (!bestRes.feasible || partitionCost < bestCost) {
+                bestRes.feasible = true;
+                bestCost = partitionCost;
+                bestRes.maxFinishTime = makespan;
+                bestRes.tankerClusters = {sim0.optimizedSequence, sim1.optimizedSequence};
+            }
         }
+        return bestRes;
+    }
 
-        auto sim0 = simulateTankerTimeWindowTour(tankerStartPositions[0], daySteps, candidateClusters[0]);
-        auto sim1 = simulateTankerTimeWindowTour(tankerStartPositions[1], daySteps, candidateClusters[1]);
+    // Tổng quát cho nTankers >= 3: Phân phối min-makespan & zero-wait tối ưu
+    vector<vector<RendezvousEvent>> clusters(nTankers);
+    vector<RendezvousEvent> sortedEvents = allEvents;
+    sort(sortedEvents.begin(), sortedEvents.end(), [](const RendezvousEvent& a, const RendezvousEvent& b) {
+        if (a.isUrgent != b.isUrgent) return a.isUrgent > b.isUrgent;
+        return a.fuelBefore < b.fuelBefore;
+    });
 
-        int makespan = max(sim0.finalStep, sim1.finalStep);
-        if (!bestRes.feasible || makespan < bestRes.maxFinishTime) {
-            bestRes.feasible = true;
-            bestRes.maxFinishTime = makespan;
-            bestRes.tankerClusters = {sim0.optimizedSequence, sim1.optimizedSequence};
+    for (const auto& ev : sortedEvents) {
+        int bestT = -1;
+        int minResultingCost = INT_MAX;
+        for (int t = 0; t < nTankers; t++) {
+            vector<RendezvousEvent> candCluster = clusters[t];
+            candCluster.push_back(ev);
+            auto sim = simulateTankerTimeWindowTour(tankerStartPositions[t], daySteps, candCluster);
+            if (sim.feasible) {
+                int candCost = sim.finalStep * 10 + sim.totalPatrolWait * 25;
+                if (candCost < minResultingCost) {
+                    minResultingCost = candCost;
+                    bestT = t;
+                }
+            }
+        }
+        if (bestT >= 0) {
+            clusters[bestT].push_back(ev);
+        } else {
+            int minLen = INT_MAX, minT = 0;
+            for (int t = 0; t < nTankers; t++) {
+                if ((int)clusters[t].size() < minLen) {
+                    minLen = (int)clusters[t].size();
+                    minT = t;
+                }
+            }
+            clusters[minT].push_back(ev);
         }
     }
 
-    return bestRes;
+    int maxFinish = 0;
+    vector<vector<RendezvousEvent>> finalClusters(nTankers);
+    for (int t = 0; t < nTankers; t++) {
+        auto sim = simulateTankerTimeWindowTour(tankerStartPositions[t], daySteps, clusters[t]);
+        finalClusters[t] = sim.optimizedSequence;
+        maxFinish = max(maxFinish, sim.finalStep);
+    }
+    return {true, maxFinish, finalClusters};
 }
 
 static bool verifyAllTankersFeasibleEvents(
@@ -1026,16 +1136,53 @@ static string planActions(const mj::Value& m) {
 
             auto currentSim = simulateTourExact(startP, pFuel, pMaxSteps, patrolTours[p]);
 
-            vector<pair<int, int>> candidateSpots;
+            struct CandidateEntry {
+                int brandPriority; // 2: new global, 1: new daily, 0: duplicate
+                int detourDist;
+                int spotPos;
+                int bestK;
+
+                bool operator<(const CandidateEntry& other) const {
+                    if (brandPriority != other.brandPriority)
+                        return brandPriority > other.brandPriority; // Ưu tiên brand mới lên trước
+                    return detourDist < other.detourDist;           // Detour phát sinh thấp hơn lên trước
+                }
+            };
+
+            vector<CandidateEntry> candidateSpots;
             for (auto& sp : g_spots) {
                 if (projectedStock[sp.pos] <= 0) continue;
                 bool alreadyIn = false;
                 for (int pos : patrolTours[p]) if (pos == sp.pos) { alreadyIn = true; break; }
                 if (alreadyIn) continue;
 
-                int d = fastDist(currentHeads[p], sp.pos);
-                if (d <= pMaxSteps) {
-                    candidateSpots.push_back({d, sp.pos});
+                int bestK = (int)patrolTours[p].size();
+                int minExtraDist = INT_MAX;
+
+                if (patrolTours[p].empty()) {
+                    bestK = 0;
+                    minExtraDist = fastDist(startP, sp.pos);
+                } else {
+                    for (size_t k = 0; k <= patrolTours[p].size(); k++) {
+                        int prevPos = (k == 0) ? startP : patrolTours[p][k - 1];
+                        int nextPos = (k == patrolTours[p].size()) ? -1 : patrolTours[p][k];
+                        int extra = fastDist(prevPos, sp.pos);
+                        if (nextPos != -1) {
+                            extra += fastDist(sp.pos, nextPos) - fastDist(prevPos, nextPos);
+                        }
+                        if (extra < minExtraDist) {
+                            minExtraDist = extra;
+                            bestK = (int)k;
+                        }
+                    }
+                }
+
+                if (minExtraDist <= pMaxSteps) {
+                    int bPri = 0;
+                    if (!g_collectedBrands.count(sp.brand)) bPri = 2;
+                    else if (!teamPlannedBrands.count(sp.brand)) bPri = 1;
+
+                    candidateSpots.push_back({bPri, minExtraDist, sp.pos, bestK});
                 }
             }
             sort(candidateSpots.begin(), candidateSpots.end());
@@ -1044,31 +1191,11 @@ static string planActions(const mj::Value& m) {
             }
 
             for (const auto& cSpot : candidateSpots) {
-                int spotPos = cSpot.second;
+                int spotPos = cSpot.spotPos;
                 int spotBrand = g_spotBrands[spotPos];
+                int bestK = cSpot.bestK;
 
                 bool isDynamicallyOwned = (dynamicVoronoiOwner[spotPos] == p);
-
-                // TÌM VỊ TRÍ CHÈN TỐI ƯU TRONG O(1) QUA BẢNG KHOẢNG CÁCH PARETO ĐÃ CÓ
-                int bestK = (int)patrolTours[p].size();
-                int minExtraDist = INT_MAX;
-
-                if (patrolTours[p].empty()) {
-                    bestK = 0;
-                } else {
-                    for (size_t k = 0; k <= patrolTours[p].size(); k++) {
-                        int prevPos = (k == 0) ? startP : patrolTours[p][k - 1];
-                        int nextPos = (k == patrolTours[p].size()) ? -1 : patrolTours[p][k];
-                        int extra = fastDist(prevPos, spotPos);
-                        if (nextPos != -1) {
-                            extra += fastDist(spotPos, nextPos) - fastDist(prevPos, nextPos);
-                        }
-                        if (extra < minExtraDist) {
-                            minExtraDist = extra;
-                            bestK = (int)k;
-                        }
-                    }
-                }
 
                 vector<int> candidateTour = patrolTours[p];
                 candidateTour.insert(candidateTour.begin() + bestK, spotPos);
@@ -1126,6 +1253,7 @@ static string planActions(const mj::Value& m) {
     vector<vector<int>> allActions(nAgs);
     vector<int>         endPos(nAgs);
     vector<int>         patrolArrivalSteps(nPatrols, 0);
+    vector<int>         actualPatrolEndFuel(nPatrols, 0);
     vector<vector<int>> patrolTimelines(nPatrols);
     map<int,int>        teamClaimedStock;
     set<int>            actualClaimedBrands;
@@ -1185,7 +1313,8 @@ static string planActions(const mj::Value& m) {
             }
         }
 
-        patrolArrivalSteps[p] = stepsUsed;
+        patrolArrivalSteps[p]  = stepsUsed;
+        actualPatrolEndFuel[p] = curFuel; // Lưu lại lượng xăng thực tế còn lại sau chặng đua
 
         int rest = daySteps - stepsUsed;
         if (rest > 0) {
@@ -1197,15 +1326,16 @@ static string planActions(const mj::Value& m) {
 
     // ── BƯỚC 5: TỐI ƯU HÓA PHÂN CỤM & LẬP LỘ TRÌNH TIẾP TẾ XE BỒN (ACTIVE FUEL-PRIORITY DISPATCH) ────
     vector<RendezvousEvent> allActualEvents;
+    int urgentThreshold = max(10, (int)(cfg::FUEL_SAFE_RATIO * g_maxFuel));
     for (int p = 0; p < nPatrols; p++) {
-        int fLeft = agents[patrolIds[p]].fuel;
+        int fLeft = actualPatrolEndFuel[p]; // Sử dụng lượng xăng thực tế còn lại, không lấy xăng đầu ngày
         allActualEvents.push_back({
             p,
             endPos[patrolIds[p]],
             patrolArrivalSteps[p],
             fLeft,
             g_maxFuel,
-            (fLeft < cfg::FUEL_SAFE_MARGIN)
+            (fLeft < urgentThreshold)
         });
     }
 
@@ -1328,6 +1458,189 @@ static void sleepMs(int ms) {
     this_thread::sleep_for(chrono::milliseconds(ms));
 }
 
+static void recordMatchBenchmark(const string& resultJson) {
+    string csvPath = "match_history.csv";
+    string jsonlPath = "match_history.jsonl";
+
+    {
+        ifstream testParent("../benchmark.py");
+        if (testParent.good()) {
+            csvPath = "../match_history.csv";
+            jsonlPath = "../match_history.jsonl";
+        }
+    }
+
+    int myRank = 0, udonTypes = 0, dailyTypesSum = 0, udonTotal = 0, respMsTotal = 0;
+    string teamId = "";
+    int oppRank = 0, oppUdonTypes = 0, oppDailySum = 0, oppUdonTotal = 0, oppRespMs = 0;
+    string oppTeamId = "";
+
+    try {
+        auto resObj = mj::parse(resultJson);
+        if (resObj) {
+            const auto& standings = (*resObj)["standings"];
+            if (standings.size() > 0) {
+                const auto& s0 = standings[0];
+                myRank = s0["rank"].asInt();
+                teamId = s0["team_id"].str;
+                udonTypes = s0["udon_types"].asInt();
+                dailyTypesSum = s0["daily_types_sum"].asInt();
+                udonTotal = s0["udon_total"].asInt();
+                respMsTotal = s0["response_ms_total"].asInt();
+            }
+            if (standings.size() > 1) {
+                const auto& s1 = standings[1];
+                oppRank = s1["rank"].asInt();
+                oppTeamId = s1["team_id"].str;
+                oppUdonTypes = s1["udon_types"].asInt();
+                oppDailySum = s1["daily_types_sum"].asInt();
+                oppUdonTotal = s1["udon_total"].asInt();
+                oppRespMs = s1["response_ms_total"].asInt();
+            }
+        }
+    } catch (...) {}
+
+    // Tính các chỉ số điều tiết sản lượng chuyên sâu (Pacing & Stability Metrics)
+    double mean = 0, sqSum = 0;
+    double sumCap = 0, sumTarget = 0, sumFloor = 0;
+    int floorViolations = 0;
+    vector<int> portions;
+    for (auto& s : g_historyStats) {
+        portions.push_back(s.collected);
+        mean += s.collected;
+        sumCap += s.opportunity;
+        sumTarget += s.target;
+        sumFloor += s.floor;
+        if (s.collected < s.floor) floorViolations++;
+    }
+    double nStats = (double)max(1, (int)g_historyStats.size());
+    double avgCap = sumCap / nStats;
+    double avgTarget = sumTarget / nStats;
+    double avgFloor = sumFloor / nStats;
+    mean /= nStats;
+
+    for (auto& s : g_historyStats) {
+        sqSum += (s.collected - mean) * (s.collected - mean);
+    }
+    double stdDev = sqrt(sqSum / nStats);
+    double cv = (mean > 0) ? (stdDev / mean) : 0.0;
+    double targetAttainment = (avgTarget > 0) ? (mean / avgTarget * 100.0) : 100.0;
+
+    time_t t = time(nullptr);
+    char timeBuf[64];
+    strftime(timeBuf, sizeof(timeBuf), "%Y-%m-%dT%H:%M:%S", localtime(&t));
+    string ts = timeBuf;
+
+    string version = "v77.0";
+
+    // 1. Ghi JSONL với chi tiết chuyên sâu từng ngày
+    {
+        ofstream fJsonl(jsonlPath.c_str(), ios::app);
+        if (fJsonl.is_open()) {
+            fJsonl << "{\"timestamp\": \"" << ts << "\", "
+                   << "\"version\": \"" << version << "\", "
+                   << "\"map_w\": " << W << ", "
+                   << "\"map_h\": " << H << ", "
+                   << "\"total_spots\": " << g_spots.size() << ", "
+                   << "\"total_brands\": " << g_allBrands.size() << ", "
+                   << "\"total_agents\": " << g_nAgents << ", "
+                   << "\"max_fuel\": " << g_maxFuel << ", "
+                   << "\"total_days\": " << g_totalDays << ", "
+                   << "\"rank\": " << myRank << ", "
+                   << "\"team_id\": \"" << teamId << "\", "
+                   << "\"udon_types\": " << udonTypes << ", "
+                   << "\"daily_types_sum\": " << dailyTypesSum << ", "
+                   << "\"udon_total\": " << udonTotal << ", "
+                   << "\"response_ms_total\": " << respMsTotal << ", "
+                   << "\"mean_day\": " << mean << ", "
+                   << "\"std_dev\": " << stdDev << ", "
+                   << "\"daily_cv\": " << cv << ", "
+                   << "\"avg_capacity\": " << avgCap << ", "
+                   << "\"avg_target\": " << avgTarget << ", "
+                   << "\"avg_floor\": " << avgFloor << ", "
+                   << "\"target_attainment_pct\": " << targetAttainment << ", "
+                   << "\"floor_violations\": " << floorViolations << ", "
+                   << "\"daily_portions\": [";
+            for (size_t i = 0; i < portions.size(); i++) {
+                if (i > 0) fJsonl << ", ";
+                fJsonl << portions[i];
+            }
+            fJsonl << "], \"daily_details\": [";
+            for (size_t i = 0; i < g_historyStats.size(); i++) {
+                if (i > 0) fJsonl << ", ";
+                fJsonl << "{\"day\": " << g_historyStats[i].day
+                       << ", \"collected\": " << g_historyStats[i].collected
+                       << ", \"capacity\": " << g_historyStats[i].opportunity
+                       << ", \"target\": " << g_historyStats[i].target
+                       << ", \"floor\": " << g_historyStats[i].floor << "}";
+            }
+            fJsonl << "], "
+                   << "\"opponent_rank\": " << oppRank << ", "
+                   << "\"opponent_team_id\": \"" << oppTeamId << "\", "
+                   << "\"opponent_udon_types\": " << oppUdonTypes << ", "
+                   << "\"opponent_daily_sum\": " << oppDailySum << ", "
+                   << "\"opponent_udon_total\": " << oppUdonTotal << ", "
+                   << "\"opponent_response_ms\": " << oppRespMs
+                   << "}\n";
+            fJsonl.flush();
+        }
+    }
+
+    // 2. Ghi CSV
+    {
+        bool fileExists = false;
+        {
+            ifstream check(csvPath.c_str());
+            if (check.is_open() && check.peek() != ifstream::traits_type::eof()) {
+                fileExists = true;
+            }
+        }
+        ofstream fCsv(csvPath.c_str(), ios::app);
+        if (fCsv.is_open()) {
+            if (!fileExists) {
+                fCsv << "timestamp,version,map_w,map_h,total_spots,total_brands,total_agents,max_fuel,total_days,rank,udon_types,daily_types_sum,udon_total,response_ms_total,mean_day,std_dev,daily_cv,avg_capacity,avg_target,avg_floor,target_attainment_pct,floor_violations\n";
+            }
+            fCsv << ts << ","
+                 << version << ","
+                 << W << ","
+                 << H << ","
+                 << g_spots.size() << ","
+                 << g_allBrands.size() << ","
+                 << g_nAgents << ","
+                 << g_maxFuel << ","
+                 << g_totalDays << ","
+                 << myRank << ","
+                 << udonTypes << ","
+                 << dailyTypesSum << ","
+                 << udonTotal << ","
+                 << respMsTotal << ","
+                 << mean << ","
+                 << stdDev << ","
+                 << cv << ","
+                 << avgCap << ","
+                 << avgTarget << ","
+                 << avgFloor << ","
+                 << targetAttainment << ","
+                 << floorViolations << "\n";
+            fCsv.flush();
+        }
+    }
+
+    fprintf(stderr, "\n============================================================\n");
+    fprintf(stderr, "[AUTO-BENCHMARK] Da tu dong luu ket qua tran dau toan dien!\n");
+    fprintf(stderr, "  - File: %s & %s\n", csvPath.c_str(), jsonlPath.c_str());
+    fprintf(stderr, "  - Official: Rank %d | Udon: %d/%zu | Daily Brands: %d | Tong: %d phan | Resp: %d ms\n",
+            myRank, udonTypes, g_allBrands.size(), dailyTypesSum, udonTotal, respMsTotal);
+    fprintf(stderr, "  - Pacing: Cap=%.1f | Target=%.1f | Floor=%.1f | Mean=%.1f | CV=%.2f | Dat: %.1f%%\n",
+            avgCap, avgTarget, avgFloor, mean, cv, targetAttainment);
+    if (floorViolations > 0) {
+        fprintf(stderr, "  - Canh bao: Co %d ngay bi tut duoi nguong an toan Floor!\n", floorViolations);
+    } else {
+        fprintf(stderr, "  - On dinh: 100%% cac ngay deu dat vuot nguong an toan Floor (0 violations)\n");
+    }
+    fprintf(stderr, "============================================================\n\n");
+}
+
 int main(int argc, char** argv) {
     string url, matchId, token;
     for (int i = 1; i < argc; i++) {
@@ -1349,10 +1662,11 @@ int main(int argc, char** argv) {
         return 2;
     }
     string base = url + "/api/v1/matches/" + matchId;
+    http::Client client(base, token);
 
     string assignBody;
     for (;;) {
-        auto r = http::request(base, "GET", "/setup", token, "");
+        auto r = client.request("GET", "/setup");
         if (r.status == 200) {
             auto v = mj::parse(r.body);
             assignBody = parseSetup(*v);
@@ -1366,12 +1680,12 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    fprintf(stderr, "=== HEXUDON BOT v74.0 (STRICT FEASIBILITY TSP PACKING & ROBUST DISPATCH) ===\n");
+    fprintf(stderr, "=== HEXUDON BOT v77.0 (TIME-WINDOW LOGISTICS & ZERO-WAIT REFUEL) ===\n");
     fprintf(stderr, "[SETUP] Map %dx%d | %zu spots | %zu brands | %d agents | maxFuel=%d | %d days\n",
             W, H, g_spots.size(), g_allBrands.size(), g_nAgents, g_maxFuel, g_totalDays);
 
     for (;;) {
-        auto r = http::request(base, "POST", "/assignment", token, assignBody);
+        auto r = client.request("POST", "/assignment", assignBody);
         if (r.status == 200) break;
         if (r.status == 0 || r.status == 429) { sleepMs(cfg::POLL_MS); continue; }
         fprintf(stderr, "POST /assignment -> HTTP %d\n", r.status);
@@ -1382,39 +1696,90 @@ int main(int argc, char** argv) {
 
     int lastDay = -1;
     for (;;) {
-        auto r = http::request(base, "GET", "/state", token, "");
+        auto r = client.request("GET", "/state");
         if (r.status == 200) {
             auto v = mj::parse(r.body);
             int day = (*v)["day"].asInt();
 
             if (day != lastDay) {
+                auto dayStartTime = chrono::steady_clock::now();
+                int dayAllowedSec = (day >= 0 && day < (int)g_daySeconds.size()) ? g_daySeconds[day] : 10;
+                if (dayAllowedSec <= 0) dayAllowedSec = 10;
+                auto dayDeadline = dayStartTime + chrono::milliseconds(dayAllowedSec * 1000 - 300); // Trừ 300ms an toàn
+
                 string acts = planActions(*v);
 
-                // GỬI ACTIONS VỚI FAST EXPONENTIAL BACKOFF CHỐNG HTTP 429 (BẮT ĐẦU TỪ 80MS)
+                // GỬI ACTIONS VỚI DEADLINE WATCHDOG & RAPID EMERGENCY FLUSH
+                bool postSuccess = false;
                 int backoffMs = 80;
-                for (int retry = 0; retry < 5; retry++) {
-                    auto pr = http::request(base, "POST", "/actions", token, acts);
+                for (int retry = 0; retry < 12; retry++) {
+                    auto now = chrono::steady_clock::now();
+                    long long msLeft = chrono::duration_cast<chrono::milliseconds>(dayDeadline - now).count();
+
+                    // Nếu còn <= 1500ms trước deadline: KÍCH HOẠT RAPID FLUSH (timeout ngắn 800ms, retry dồn dập 40ms)
+                    bool isEmergency = (msLeft <= 1500);
+                    int reqTimeout = isEmergency ? 800 : 1500;
+
+                    auto pr = client.request("POST", "/actions", acts, reqTimeout);
                     if (pr.status == 200) {
+                        postSuccess = true;
                         break;
                     }
+
+                    if (isEmergency) {
+                        fprintf(stderr, "[EMERGENCY WATCHDOG] Day %d con lai %lldms! Rapid retry %d/12...\n", day, msLeft, retry + 1);
+                        sleepMs(40); // Bắn dồn dập cách nhau 40ms
+                        continue;
+                    }
+
                     if (pr.status == 429) {
-                        fprintf(stderr, "[RATE-LIMIT] POST /actions day %d -> HTTP 429, retry %d/5 sau %dms...\n", day, retry + 1, backoffMs);
+                        fprintf(stderr, "[RATE-LIMIT] POST /actions day %d -> HTTP 429, retry %d/12 sau %dms...\n", day, retry + 1, backoffMs);
                         sleepMs(backoffMs);
                         backoffMs = min(1500, backoffMs * 2);
                         continue;
                     }
+
                     fprintf(stderr, "[ERR] POST /actions day %d -> HTTP %d: %s\n",
                             day, pr.status, pr.body.c_str());
-                    break;
+                    sleepMs(backoffMs);
+                    backoffMs = min(1500, backoffMs * 2);
                 }
-                lastDay = day; // Khóa chặt day để không bao giờ tính toán lại hay spam server trong cùng 1 ngày
+
+                if (!postSuccess) {
+                    // Cứu nguy cận hạn tuyệt đối: Bắn gói Safe Fallback Action đứng yên để giữ điểm
+                    auto now = chrono::steady_clock::now();
+                    long long msLeft = chrono::duration_cast<chrono::milliseconds>(dayDeadline - now).count();
+                    if (msLeft > 0) {
+                        int daySteps = (day >= 0 && day < (int)g_daySteps.size()) ? g_daySteps[day] : 30;
+                        ostringstream safeOut;
+                        safeOut << "[";
+                        for (int i = 0; i < g_nAgents; i++) {
+                            if (i) safeOut << ",";
+                            safeOut << "[-" << daySteps << "]";
+                        }
+                        safeOut << "]";
+                        fprintf(stderr, "[SAFE FALLBACK] Ban goi hanh dong an toan de cuu diem Day %d!\n", day);
+                        auto pr = client.request("POST", "/actions", safeOut.str(), 600);
+                        if (pr.status == 200) postSuccess = true;
+                    }
+                }
+
+                if (postSuccess) {
+                    lastDay = day; // CHỈ KHÓA DAY KHI XÁC NHẬN SERVER ĐÃ NHẬN THÀNH CÔNG (HTTP 200)
+                } else {
+                    fprintf(stderr, "[WARN] POST /actions day %d chua thanh cong sau 12 lan thu, se retry o chu ky tiep theo...\n", day);
+                }
             }
         } else if (r.status == 429) {
             sleepMs(400); // Backoff nhanh nếu GET /state bị rate-limit
         } else if (r.status != 0) {
-            auto rr = http::request(base, "GET", "/result", token, "");
+            auto rr = client.request("GET", "/result");
             if (rr.status == 200) {
                 fprintf(stderr, "[RESULT] %s\n", rr.body.c_str());
+                const char* envRunner = getenv("HEXUDON_BENCHMARK_RUNNER");
+                if (!envRunner || string(envRunner) != "1") {
+                    recordMatchBenchmark(rr.body);
+                }
                 break;
             }
         }

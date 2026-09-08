@@ -10,3 +10,10 @@ $RECYCLE.BIN/
 
 # Windows shortcuts
 *.lnk
+
+# Benchmark history logs (keep safe across git checkouts)
+match_history.jsonl
+match_history.csv
+
+# Compiled bot binaries
+*.exe
