@@ -1,5 +1,5 @@
 // ========================================================================
-//  HEXUDON BOT v80.0 (MID-ROUTE MULTI-RENDEZVOUS & GLOBAL MARGINAL UDON PLANNER)
+//  HEXUDON BOT v81.0 (PRECISION TIMELINE RENDEZVOUS & DUAL-TIER FLEET LOGISTICS)
 // ========================================================================
 //  Đột Phá Kiến Trúc Tối Thượng: Phá Bỏ Rào Cản Bình Xăng & Kết Nối Xe Tuần Tra - Xe Bồn
 //    1. MID-ROUTE MULTI-RENDEZVOUS:
@@ -863,123 +863,79 @@ static BestMultiTankerPartition findOptimalTankerPartition(
 }
 
 // ========================================================================
-//  KIẾN TRÚC TIẾP TẾ GIỮA CHẶNG: MÔ PHỎNG TOUR CÙNG ĐIỂM HẸN (MID-ROUTE RENDEZVOUS)
+//  ĐIỀU PHỐI ĐIỂM HẸN NHANH & CHÍNH XÁC (ULTRA-FAST MID-ROUTE RENDEZVOUS EVALUATOR)
 // ========================================================================
-struct TourWithRendezvousResult {
+struct EvalCandidateResult {
     bool feasible;
-    bool hasRendezvous;
+    bool hasMidRoute;
     int totalSteps;
-    int totalFuel;
     int rendezvousSpotIdx; // Vị trí quán trong tour diễn ra tiếp tế (-1 nếu không có)
     int rendezvousPos;     // Tọa độ ô tiếp tế
-    int rendezvousTime;    // Bước thời gian diễn ra tiếp tế
-    int fuelBeforeRefuel;  // Lượng xăng còn lại trước khi nạp
+    int tankerCost;        // Chi phí di chuyển của xe bồn đến điểm hẹn
     int assignedTanker;    // Chỉ số xe bồn phục vụ (0 .. nTankers-1)
-    int tankerCost;        // Chi phí thời gian xe bồn
-    int patrolWait;        // Số bước patrol phải đợi xe bồn (thường = 0)
-    vector<vector<int>> exactLegPaths; // Toàn bộ đường đi từng chặng
 };
 
-static TourWithRendezvousResult simulateTourWithRendezvous(
-    int startPos,
-    int startFuel,
-    int maxStepsLimit,
-    const vector<int>& tour,
-    int patrolId,
-    int daySteps,
+static EvalCandidateResult evalCandidateTour(
+    int startP, int pFuel, int pMaxSteps,
+    const vector<int>& tour, int patrolId, int daySteps,
     const vector<int>& tankerStartPositions,
-    const vector<vector<RendezvousEvent>>& tankerPlannedEvents) {
+    const vector<int>& tankerBusyUntil) {
 
-    if (tour.empty()) {
-        return {true, false, 0, 0, -1, -1, 0, 0, -1, 0, 0, {}};
+    (void)patrolId;
+    // 1. Kiểm tra tour độc lập bằng xăng hiện tại (ưu tiên tối đa, không cần xe bồn giữa chặng)
+    auto directSim = simulateTourExact(startP, pFuel, pMaxSteps, tour);
+    if (directSim.feasible) {
+        return {true, false, directSim.totalSteps, -1, -1, 0, -1};
     }
 
-    // 1. Kiểm tra nếu đi được độc lập bằng xăng hiện tại (không cần gọi xe bồn giữa chặng)
-    auto noRendezSim = simulateTourExact(startPos, startFuel, maxStepsLimit, tour);
-    if (noRendezSim.feasible) {
-        return {true, false, noRendezSim.totalSteps, noRendezSim.totalFuel, -1, -1, 0, 0, -1, 0, 0, noRendezSim.exactLegPaths};
-    }
-
-    // Nếu không có xe bồn hoặc tour chỉ có 1 quán mà không đi nổi -> Thất bại
+    // 2. Nếu không đủ xăng đi độc lập, kiểm tra phương án tiếp tế giữa chặng:
     int nTankers = (int)tankerStartPositions.size();
     if (nTankers == 0 || tour.size() <= 1) {
-        return {false, false, INT_MAX, INT_MAX, -1, -1, 0, 0, -1, INT_MAX, INT_MAX, {}};
+        return {false, false, INT_MAX, -1, -1, INT_MAX, -1};
     }
 
-    // 2. Thử nghiệm từng quán r trong tour làm điểm hẹn tiếp tế (0 <= r < tour.size() - 1)
-    TourWithRendezvousResult bestResult = {false, false, INT_MAX, INT_MAX, -1, -1, 0, 0, -1, INT_MAX, INT_MAX, {}};
-    double bestMarginalCost = 1e9;
-
+    // Tìm điểm hẹn r xa nhất có thể tới được bằng pFuel (duyệt ngược từ K-2 về 0)
     int K = (int)tour.size();
-    for (int r = 0; r < K - 1; r++) {
-        // Chặng 1: Từ xuất phát đến quán tour[r] bằng xăng hiện tại
+    for (int r = K - 2; r >= 0; r--) {
         vector<int> subTour1(tour.begin(), tour.begin() + r + 1);
-        auto sim1 = simulateTourExact(startPos, startFuel, maxStepsLimit, subTour1);
+        auto sim1 = simulateTourExact(startP, pFuel, pMaxSteps, subTour1);
         if (!sim1.feasible) continue;
 
         int tR = sim1.totalSteps;
-        int fuelBefore = startFuel - sim1.totalFuel;
         int rPos = tour[r];
-
-        // Chặng 2: Từ quán tour[r] đến hết tour với bình xăng đầy (g_maxFuel)
-        // Xe bồn gặp tại rPos. Tiếp tế tốn ít nhất 1 step.
-        int stepsRemaining = maxStepsLimit - tR - 1;
+        int stepsRemaining = pMaxSteps - tR - 1;
         if (stepsRemaining <= 0) continue;
 
         vector<int> subTour2(tour.begin() + r + 1, tour.end());
         auto sim2 = simulateTourExact(rPos, g_maxFuel, stepsRemaining, subTour2);
         if (!sim2.feasible) continue;
 
-        // 3. Tìm xe bồn có khả năng đến rPos vào thời điểm tR với Zero-Wait (hoặc wait <= 1)
+        // Tìm xe bồn có thể đến rPos trước hoặc đúng lúc tR (Zero-Wait)
         int bestTanker = -1;
-        int minTankerCost = INT_MAX;
-        int bestPatrolWait = INT_MAX;
+        int minTankerDist = INT_MAX;
 
         for (int t = 0; t < nTankers; t++) {
-            // Lọc bỏ sự kiện tiếp tế giữa chặng cũ của chính patrol này nếu có
-            vector<RendezvousEvent> candEvents;
-            for (const auto& ev : tankerPlannedEvents[t]) {
-                if (ev.patrolId != patrolId) {
-                    candEvents.push_back(ev);
-                }
-            }
-            candEvents.push_back({patrolId, rPos, tR, fuelBefore, g_maxFuel, false, true});
+            int tAvail = tankerBusyUntil[t];
+            int dist = fastDist(tankerStartPositions[t], rPos);
+            if (dist == INT_MAX) continue;
+            int tArrive = max(tAvail, dist);
 
-            auto tSim = simulateTankerTimeWindowTour(tankerStartPositions[t], daySteps, candEvents);
-            if (tSim.feasible && tSim.totalPatrolWait <= 1) {
-                int tCost = tSim.finalStep;
-                if (tCost < minTankerCost) {
-                    minTankerCost = tCost;
+            // Xe bồn phải đến kịp tR (Zero-Wait) và còn thời gian tiếp tế trong ngày
+            if (tArrive <= tR && tR + 1 <= daySteps) {
+                if (dist < minTankerDist) {
+                    minTankerDist = dist;
                     bestTanker = t;
-                    bestPatrolWait = tSim.totalPatrolWait;
                 }
             }
         }
 
         if (bestTanker != -1) {
-            int totalPatrolSteps = sim1.totalSteps + bestPatrolWait + 1 + sim2.totalSteps;
-            int totalPatrolFuel  = sim1.totalFuel + sim2.totalFuel;
-            double marginalCost  = (double)totalPatrolSteps + 0.4 * (double)minTankerCost;
-
-            if (marginalCost < bestMarginalCost) {
-                bestMarginalCost = marginalCost;
-
-                vector<vector<int>> combinedPaths = sim1.exactLegPaths;
-                for (const auto& leg : sim2.exactLegPaths) {
-                    combinedPaths.push_back(leg);
-                }
-
-                bestResult = {
-                    true, true, totalPatrolSteps, totalPatrolFuel,
-                    r, rPos, tR, fuelBefore,
-                    bestTanker, minTankerCost, bestPatrolWait,
-                    combinedPaths
-                };
-            }
+            int totalSteps = sim1.totalSteps + 1 + sim2.totalSteps;
+            return {true, true, totalSteps, r, rPos, minTankerDist, bestTanker};
         }
     }
 
-    return bestResult;
+    return {false, false, INT_MAX, -1, -1, INT_MAX, -1};
 }
 
 static bool verifyAllTankersFeasibleEvents(
@@ -1221,21 +1177,21 @@ static string planActions(const mj::Value& m) {
         currentTeamPortions += (int)patrolTours[p].size();
     }
 
-    vector<TourWithRendezvousResult> patrolTourResults(nPatrols);
-    vector<vector<RendezvousEvent>> tankerPlannedEvents(nTankers);
+    vector<bool> patrolHasMidRoute(nPatrols, false);
+    vector<int>  patrolRendezvousSpotIdx(nPatrols, -1);
+    vector<int>  patrolRendezvousPos(nPatrols, -1);
+    vector<int>  patrolAssignedTanker(nPatrols, -1);
+    vector<int>  patrolRendezvousTime(nPatrols, 0);
 
-    for (int p = 0; p < nPatrols; p++) {
-        int startP = startPositions[p];
-        int pFuel  = agents[patrolIds[p]].fuel;
-        bool startsOnSpot = false;
-        for (auto& sp : g_spots) if (sp.pos == startP) { startsOnSpot = true; break; }
-        int pMaxSteps = maxPatrolPhysicalSteps - (startsOnSpot ? 1 : 0);
-
-        patrolTourResults[p] = simulateTourWithRendezvous(
-            startP, pFuel, pMaxSteps, patrolTours[p],
-            p, daySteps, tankerStartPositions, tankerPlannedEvents
-        );
-    }
+    auto getTankerBusyUntil = [&](int t) {
+        int busy = 0;
+        for (int p = 0; p < nPatrols; p++) {
+            if (patrolHasMidRoute[p] && patrolAssignedTanker[p] == t) {
+                busy = max(busy, patrolRendezvousTime[p] + 1);
+            }
+        }
+        return busy;
+    };
 
     auto getEndPosOfPatrol = [&](int p, const vector<int>& tour) {
         return (tour.empty()) ? startPositions[p] : tour.back();
@@ -1251,7 +1207,7 @@ static string planActions(const mj::Value& m) {
         int bestSpot = -1;
         LexicographicScore bestLexScore = {-1, -1, -1, -1e9, -1e9};
         vector<int> bestTourCandidate;
-        TourWithRendezvousResult bestSimResult;
+        EvalCandidateResult bestEvalResult;
 
         vector<int> currentHeads(nPatrols);
         for (int p = 0; p < nPatrols; p++) {
@@ -1272,6 +1228,9 @@ static string planActions(const mj::Value& m) {
             dynamicVoronoiOwner[sp.pos] = bestP;
         }
 
+        vector<int> tankerBusyUntil(nTankers);
+        for (int t = 0; t < nTankers; t++) tankerBusyUntil[t] = getTankerBusyUntil(t);
+
         for (int p = 0; p < nPatrols; p++) {
             int startP = startPositions[p];
             int pFuel  = agents[patrolIds[p]].fuel;
@@ -1281,8 +1240,26 @@ static string planActions(const mj::Value& m) {
             }
             int pMaxSteps = maxPatrolPhysicalSteps - (startsOnSpot ? 1 : 0);
 
-            const auto& currentSim = patrolTourResults[p];
-            int currentSteps = currentSim.feasible ? currentSim.totalSteps : 0;
+            // Bước hiện tại của tour hiện tại
+            int currentSteps = 0;
+            if (!patrolTours[p].empty()) {
+                auto curSim = simulateTourExact(startP, pFuel, pMaxSteps, patrolTours[p]);
+                if (curSim.feasible) {
+                    currentSteps = curSim.totalSteps;
+                } else if (patrolHasMidRoute[p] && patrolRendezvousSpotIdx[p] >= 0) {
+                    int r = patrolRendezvousSpotIdx[p];
+                    vector<int> s1(patrolTours[p].begin(), patrolTours[p].begin() + r + 1);
+                    auto sim1 = simulateTourExact(startP, pFuel, pMaxSteps, s1);
+                    int rem = pMaxSteps - sim1.totalSteps - 1;
+                    if (r + 1 < (int)patrolTours[p].size()) {
+                        vector<int> s2(patrolTours[p].begin() + r + 1, patrolTours[p].end());
+                        auto sim2 = simulateTourExact(patrolTours[p][r], g_maxFuel, rem, s2);
+                        currentSteps = sim1.totalSteps + 1 + sim2.totalSteps;
+                    } else {
+                        currentSteps = sim1.totalSteps + 1;
+                    }
+                }
+            }
 
             struct CandidateEntry {
                 int brandPriority; // 2: new global, 1: new daily, 0: duplicate
@@ -1348,15 +1325,15 @@ static string planActions(const mj::Value& m) {
                 vector<int> candidateTour = patrolTours[p];
                 candidateTour.insert(candidateTour.begin() + bestK, spotPos);
 
-                auto candSim = simulateTourWithRendezvous(
+                auto evalRes = evalCandidateTour(
                     startP, pFuel, pMaxSteps, candidateTour,
-                    p, daySteps, tankerStartPositions, tankerPlannedEvents
+                    p, daySteps, tankerStartPositions, tankerBusyUntil
                 );
-                if (!candSim.feasible) continue;
+                if (!evalRes.feasible) continue;
 
-                int deltaSteps = max(1, candSim.totalSteps - currentSteps);
-                double effectiveCost = candSim.hasRendezvous
-                    ? ((double)deltaSteps + 0.4 * (double)candSim.tankerCost)
+                int deltaSteps = max(1, evalRes.totalSteps - currentSteps);
+                double effectiveCost = evalRes.hasMidRoute
+                    ? ((double)deltaSteps + 0.3 * (double)evalRes.tankerCost)
                     : (double)deltaSteps;
 
                 LexicographicScore candScore;
@@ -1380,7 +1357,7 @@ static string planActions(const mj::Value& m) {
                     bestPatrol = p;
                     bestSpot = spotPos;
                     bestTourCandidate = candidateTour;
-                    bestSimResult = candSim;
+                    bestEvalResult = evalRes;
                 }
             }
         }
@@ -1388,47 +1365,22 @@ static string planActions(const mj::Value& m) {
         if (bestPatrol < 0) break;
 
         // CHỈ CHẠY 2-OPT CHO TOUR ĐỘC LẬP KHÔNG RENDEZVOUS
-        if (!bestSimResult.hasRendezvous && bestTourCandidate.size() > 2) {
+        if (!bestEvalResult.hasMidRoute && bestTourCandidate.size() > 2) {
             int startP = startPositions[bestPatrol];
             int pFuel  = agents[patrolIds[bestPatrol]].fuel;
             bool startsOnSpot = false;
             for (auto& sp : g_spots) if (sp.pos == startP) { startsOnSpot = true; break; }
             int pMaxSteps = maxPatrolPhysicalSteps - (startsOnSpot ? 1 : 0);
 
-            auto optTour = optimizeTour2OptExact(startP, pFuel, pMaxSteps, bestTourCandidate);
-            auto optSim  = simulateTourExact(startP, pFuel, pMaxSteps, optTour);
-            if (optSim.feasible) {
-                bestTourCandidate = optTour;
-                bestSimResult = {true, false, optSim.totalSteps, optSim.totalFuel, -1, -1, 0, 0, -1, 0, 0, optSim.exactLegPaths};
-            }
+            bestTourCandidate = optimizeTour2OptExact(startP, pFuel, pMaxSteps, bestTourCandidate);
         }
 
         patrolTours[bestPatrol] = bestTourCandidate;
-        patrolTourResults[bestPatrol] = bestSimResult;
-
-        // Cập nhật cam kết của xe bồn: Xóa sự kiện cũ của bestPatrol trên mọi xe bồn
-        for (int t = 0; t < nTankers; t++) {
-            vector<RendezvousEvent> updatedEvents;
-            for (const auto& ev : tankerPlannedEvents[t]) {
-                if (ev.patrolId != bestPatrol) {
-                    updatedEvents.push_back(ev);
-                }
-            }
-            tankerPlannedEvents[t] = updatedEvents;
-        }
-
-        // Nếu tour mới có điểm hẹn tiếp tế, ghi nhận vào xe bồn được chỉ định
-        if (bestSimResult.hasRendezvous && bestSimResult.assignedTanker >= 0 && bestSimResult.assignedTanker < nTankers) {
-            tankerPlannedEvents[bestSimResult.assignedTanker].push_back({
-                bestPatrol,
-                bestSimResult.rendezvousPos,
-                bestSimResult.rendezvousTime,
-                bestSimResult.fuelBeforeRefuel,
-                g_maxFuel,
-                false,
-                true // isMidRoute
-            });
-        }
+        patrolHasMidRoute[bestPatrol] = bestEvalResult.hasMidRoute;
+        patrolRendezvousSpotIdx[bestPatrol] = bestEvalResult.rendezvousSpotIdx;
+        patrolRendezvousPos[bestPatrol] = bestEvalResult.rendezvousPos;
+        patrolAssignedTanker[bestPatrol] = bestEvalResult.assignedTanker;
+        patrolRendezvousTime[bestPatrol] = bestEvalResult.totalSteps;
 
         projectedStock[bestSpot]--;
         teamPlannedBrands.insert(g_spotBrands[bestSpot]);
@@ -1443,6 +1395,7 @@ static string planActions(const mj::Value& m) {
     vector<vector<int>> patrolTimelines(nPatrols);
     map<int,int>        teamClaimedStock;
     set<int>            actualClaimedBrands;
+    vector<RendezvousEvent> confirmedMidRouteEvents;
 
     for (int p = 0; p < nPatrols; p++) {
         int pi = patrolIds[p];
@@ -1451,7 +1404,6 @@ static string planActions(const mj::Value& m) {
         int stepsUsed = 0;
 
         patrolTimelines[p].push_back(curPos);
-
         set<int> visitedSpotsThisPatrol;
 
         auto tryClaimThisPatrol = [&](int cell) {
@@ -1466,7 +1418,7 @@ static string planActions(const mj::Value& m) {
             return false;
         };
 
-        // Thu hoạch ngay tại chỗ nếu ô xuất phát là quán ăn (CẦN PHÁT HÀNH ĐỘNG -1 ĐỂ SERVER GHI NHẬN)
+        // Thu hoạch ngay tại chỗ nếu ô xuất phát là quán ăn
         if (tryClaimThisPatrol(curPos)) {
             if (stepsUsed < maxPatrolPhysicalSteps) {
                 allActions[pi].push_back(-1);
@@ -1475,43 +1427,84 @@ static string planActions(const mj::Value& m) {
             }
         }
 
-        const auto& tourSim = patrolTourResults[p];
+        int pMaxSteps = maxPatrolPhysicalSteps - stepsUsed;
+        bool hasMidRoute = patrolHasMidRoute[p];
+        int rIdx = patrolRendezvousSpotIdx[p];
 
-        for (size_t legIdx = 0; legIdx < tourSim.exactLegPaths.size(); legIdx++) {
-            const vector<int>& path = tourSim.exactLegPaths[legIdx];
-
-            for (int nxt : path) {
-                auto cost = moveCost(curPos, traffic[curPos]);
-                int sc = cost.first, fc = cost.second;
-
-                if (sc < 0 || stepsUsed + sc > maxPatrolPhysicalSteps || curFuel < fc) break;
-                int d = dirTo(curPos, nxt);
-                if (d < 0) break;
-
-                allActions[pi].push_back(d);
-                for (int s = 0; s < sc; s++) patrolTimelines[p].push_back(nxt);
-
-                stepsUsed += sc;
-                curFuel   -= fc;
-                curPos     = nxt;
-                tryClaimThisPatrol(curPos);
+        if (!hasMidRoute || rIdx < 0 || rIdx >= (int)patrolTours[p].size()) {
+            // Tour độc lập: Mô phỏng chính xác với pMaxSteps còn lại thực tế
+            auto tourSim = simulateTourExact(curPos, curFuel, pMaxSteps, patrolTours[p]);
+            for (size_t legIdx = 0; legIdx < tourSim.exactLegPaths.size(); legIdx++) {
+                for (int nxt : tourSim.exactLegPaths[legIdx]) {
+                    auto cost = moveCost(curPos, traffic[curPos]);
+                    int sc = cost.first, fc = cost.second;
+                    if (sc < 0 || stepsUsed + sc > maxPatrolPhysicalSteps || curFuel < fc) break;
+                    int d = dirTo(curPos, nxt);
+                    if (d < 0) break;
+                    allActions[pi].push_back(d);
+                    for (int s = 0; s < sc; s++) patrolTimelines[p].push_back(nxt);
+                    stepsUsed += sc; curFuel -= fc; curPos = nxt;
+                    tryClaimThisPatrol(curPos);
+                }
+            }
+        } else {
+            // Tour có tiếp tế giữa chặng:
+            // Chặng 1: Từ curPos đến quán thứ rIdx
+            vector<int> subTour1(patrolTours[p].begin(), patrolTours[p].begin() + rIdx + 1);
+            auto sim1 = simulateTourExact(curPos, curFuel, pMaxSteps, subTour1);
+            for (size_t legIdx = 0; legIdx < sim1.exactLegPaths.size(); legIdx++) {
+                for (int nxt : sim1.exactLegPaths[legIdx]) {
+                    auto cost = moveCost(curPos, traffic[curPos]);
+                    int sc = cost.first, fc = cost.second;
+                    if (sc < 0 || stepsUsed + sc > maxPatrolPhysicalSteps || curFuel < fc) break;
+                    int d = dirTo(curPos, nxt);
+                    if (d < 0) break;
+                    allActions[pi].push_back(d);
+                    for (int s = 0; s < sc; s++) patrolTimelines[p].push_back(nxt);
+                    stepsUsed += sc; curFuel -= fc; curPos = nxt;
+                    tryClaimThisPatrol(curPos);
+                }
             }
 
-            // TIẾP TẾ GIỮA CHẶNG: Khi đến quán hẹn tiếp tế, chờ nạp xăng và reset curFuel về g_maxFuel
-            if (tourSim.hasRendezvous && (int)legIdx == tourSim.rendezvousSpotIdx) {
-                int refuelWait = 1 + max(0, tourSim.patrolWait);
-                if (stepsUsed + refuelWait <= maxPatrolPhysicalSteps) {
-                    allActions[pi].push_back(-refuelWait);
-                    for (int s = 0; s < refuelWait; s++) patrolTimelines[p].push_back(curPos);
-                    stepsUsed += refuelWait;
-                    curFuel = g_maxFuel; // Tiếp tế thành công!
+            // Ghi nhận chính xác bước thời gian và vị trí tiếp tế
+            int rStep = stepsUsed;
+            int rCell = curPos;
+
+            // Dừng tại chỗ 1 bước để tiếp tế
+            if (stepsUsed < maxPatrolPhysicalSteps) {
+                allActions[pi].push_back(-1);
+                patrolTimelines[p].push_back(curPos);
+                stepsUsed += 1;
+                curFuel = g_maxFuel; // Nạp đầy xăng!
+
+                confirmedMidRouteEvents.push_back({
+                    p, rCell, rStep, 0, g_maxFuel, true, true
+                });
+            }
+
+            // Chặng 2: Từ quán thứ rIdx đến hết tour với bình xăng đầy g_maxFuel
+            if (rIdx + 1 < (int)patrolTours[p].size()) {
+                vector<int> subTour2(patrolTours[p].begin() + rIdx + 1, patrolTours[p].end());
+                int remSteps = maxPatrolPhysicalSteps - stepsUsed;
+                auto sim2 = simulateTourExact(curPos, curFuel, remSteps, subTour2);
+                for (size_t legIdx = 0; legIdx < sim2.exactLegPaths.size(); legIdx++) {
+                    for (int nxt : sim2.exactLegPaths[legIdx]) {
+                        auto cost = moveCost(curPos, traffic[curPos]);
+                        int sc = cost.first, fc = cost.second;
+                        if (sc < 0 || stepsUsed + sc > maxPatrolPhysicalSteps || curFuel < fc) break;
+                        int d = dirTo(curPos, nxt);
+                        if (d < 0) break;
+                        allActions[pi].push_back(d);
+                        for (int s = 0; s < sc; s++) patrolTimelines[p].push_back(nxt);
+                        stepsUsed += sc; curFuel -= fc; curPos = nxt;
+                        tryClaimThisPatrol(curPos);
+                    }
                 }
             }
         }
 
         patrolArrivalSteps[p]  = stepsUsed;
-        actualPatrolEndFuel[p] = curFuel; // Lưu lại lượng xăng thực tế còn lại sau chặng đua
-
+        actualPatrolEndFuel[p] = curFuel;
         int rest = daySteps - stepsUsed;
         if (rest > 0) {
             allActions[pi].push_back(-rest);
@@ -1521,12 +1514,13 @@ static string planActions(const mj::Value& m) {
     }
 
     // ── BƯỚC 5: TỐI ƯU HÓA TIẾP TẾ XE BỒN (MID-ROUTE + END-OF-DAY ACTIVE DISPATCH) ────
-    vector<RendezvousEvent> endOfDayCandidates;
+    vector<RendezvousEvent> allActualEvents = confirmedMidRouteEvents;
     int urgentThreshold = max(10, (int)(cfg::FUEL_SAFE_RATIO * g_maxFuel));
+
     for (int p = 0; p < nPatrols; p++) {
         int fLeft = actualPatrolEndFuel[p];
         if (fLeft < g_maxFuel) {
-            endOfDayCandidates.push_back({
+            allActualEvents.push_back({
                 p,
                 endPos[patrolIds[p]],
                 patrolArrivalSteps[p],
@@ -1538,36 +1532,16 @@ static string planActions(const mj::Value& m) {
         }
     }
 
-    sort(endOfDayCandidates.begin(), endOfDayCandidates.end(), [&](const RendezvousEvent& a, const RendezvousEvent& b) {
-        if (a.isUrgent != b.isUrgent) return a.isUrgent > b.isUrgent;
-        return a.fuelBefore < b.fuelBefore;
-    });
-
-    vector<vector<RendezvousEvent>> finalTankerEvents = tankerPlannedEvents;
-    for (const auto& ev : endOfDayCandidates) {
-        int bestT = -1;
-        int minCost = INT_MAX;
-        for (int t = 0; t < nTankers; t++) {
-            vector<RendezvousEvent> candList = finalTankerEvents[t];
-            candList.push_back(ev);
-            auto tSim = simulateTankerTimeWindowTour(tankerStartPositions[t], daySteps, candList);
-            if (tSim.feasible) {
-                int cost = tSim.finalStep * 10 + tSim.totalPatrolWait * 25;
-                if (cost < minCost) {
-                    minCost = cost;
-                    bestT = t;
-                }
-            }
-        }
-        if (bestT >= 0) {
-            finalTankerEvents[bestT].push_back(ev);
-        }
-    }
+    auto optimalPartition = findOptimalTankerPartition(tankerStartPositions, allActualEvents, daySteps);
 
     for (int t = 0; t < nTankers; t++) {
         int ti = tankerIds[t];
+        const vector<RendezvousEvent>& assignedEvents = (t < (int)optimalPartition.tankerClusters.size())
+            ? optimalPartition.tankerClusters[t]
+            : vector<RendezvousEvent>{};
+
         allActions[ti] = planSingleTankerRouteTimeWindow(
-            agents[ti].pos, daySteps, traffic, finalTankerEvents[t]
+            agents[ti].pos, daySteps, traffic, assignedEvents
         );
     }
 
@@ -1750,7 +1724,7 @@ static void recordMatchBenchmark(const string& resultJson) {
     strftime(timeBuf, sizeof(timeBuf), "%Y-%m-%dT%H:%M:%S", localtime(&t));
     string ts = timeBuf;
 
-    string version = "v80.0";
+    string version = "v81.0";
 
     // 1. Ghi JSONL với chi tiết chuyên sâu từng ngày
     {
@@ -1899,7 +1873,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    fprintf(stderr, "=== HEXUDON BOT v80.0 (MID-ROUTE MULTI-RENDEZVOUS & GLOBAL MARGINAL UDON PLANNER) ===\n");
+    fprintf(stderr, "=== HEXUDON BOT v81.0 (PRECISION TIMELINE RENDEZVOUS & DUAL-TIER FLEET LOGISTICS) ===\n");
     fprintf(stderr, "[SETUP] Map %dx%d | %zu spots | %zu brands | %d agents | maxFuel=%d | %d days\n",
             W, H, g_spots.size(), g_allBrands.size(), g_nAgents, g_maxFuel, g_totalDays);
 
