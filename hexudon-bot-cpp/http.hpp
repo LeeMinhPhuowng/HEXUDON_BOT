@@ -63,8 +63,8 @@ private:
         if (!m_hSession) {
             m_hSession = WinHttpOpen(L"HexudonBot/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
             if (!m_hSession) return false;
-            // FAIL-FAST TIMEOUTS: 1200ms connect, 1500ms send, 1500ms receive (thay vì 30-60s mặc định của Windows)
-            WinHttpSetTimeouts(m_hSession, 1200, 1200, 1500, 1500);
+            // FAIL-FAST TIMEOUTS: 1000ms connect, 1000ms send, 1000ms receive (giảm từ 1200/1500ms)
+            WinHttpSetTimeouts(m_hSession, 1000, 1000, 1000, 1000);
         }
         INTERNET_PORT nPort = (INTERNET_PORT)std::atoi(m_port.c_str());
         m_hConnect = WinHttpConnect(m_hSession, toWide(m_host).c_str(), nPort, 0);

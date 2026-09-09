@@ -1,5 +1,5 @@
 // ========================================================================
-//  HEXUDON BOT v71.0 (ACTIVE FUEL-PRIORITY TANKER DISPATCH & FLEET ENDURANCE)
+//  HEXUDON BOT v72.0 (ACTIVE FUEL-PRIORITY TANKER DISPATCH & FLEET ENDURANCE + STRATEGIC REPOSITIONING)
 // ========================================================================
 //  Giải Quyết Triệt Để Vấn Đề "Không Ổn Định" (Giảm từ 49 xuống 7 phần ăn):
 //    1. NGUYÊN NHÂN TẬN GỐC TỪ LOG:
@@ -42,11 +42,11 @@
 using namespace std;
 
 namespace cfg {
-    constexpr int    POLL_MS          = 215; // Tối ưu hóa chu kỳ Polling (>= 200ms an toàn theo quy định BTC)
+    constexpr int    POLL_MS          = 200; // Tối thiểu theo quy định BTC (200ms), giảm latency polling
     constexpr double EMA_ALPHA        = 0.35;
     constexpr double LAMBDA_LOW       = 2.5;
     constexpr double LAMBDA_HIGH      = 0.05;
-    constexpr int    TOP_CANDIDATES   = 25;
+    constexpr int    TOP_CANDIDATES   = 12;  // Giảm từ 25→12: ít candidate hơn = ít simulateTourExact = nhanh hơn
     constexpr double FUEL_SAFE_RATIO  = 0.35; // Ngưỡng an toàn xăng động (35% maxFuel)
 }
 
@@ -163,6 +163,121 @@ static pair<int,int> moveCost(int pos, int trafficStatus) {
 static int dirTo(int a, int b) {
     for (int d = 0; d < 6; d++) if (neighbor(a, d) == b) return d;
     return -1;
+}
+
+// ── BFS NHẸ: TÌM ĐƯỜNG NGẮN NHẤT HOP-COUNT CHO REPOSITIONING ──────────
+static vector<int> bfsLightPath(int src, int dst) {
+    if (src == dst) return {};
+    int N = W * H;
+    vector<int> prev(N, -2);
+    prev[src] = -1;
+    queue<int> q;
+    q.push(src);
+    while (!q.empty()) {
+        int u = q.front(); q.pop();
+        if (u == dst) break;
+        for (int d = 0; d < 6; d++) {
+            int nb = neighbor(u, d);
+            if (nb < 0 || nb >= N || g_cells[nb] == 3 || prev[nb] != -2) continue;
+            prev[nb] = u;
+            q.push(nb);
+        }
+    }
+    if (prev[dst] == -2) return {};
+    vector<int> path;
+    for (int x = dst; x != src; x = prev[x]) path.push_back(x);
+    reverse(path.begin(), path.end());
+    return path;
+}
+
+// ── TÌM Ô TỐI ƯU ĐỂ PARK CUỐI NGÀY (TRAFFIC AVOIDANCE + POSITIONING) ──
+static int findBestParkingPos(
+    int curPos, int stepsLeft, int fuelLeft,
+    const vector<int>& traffic, bool isTanker)
+{
+    int N = W * H;
+    if (stepsLeft <= 0) return curPos;
+    vector<int> bestCost(N, INT_MAX);
+    bestCost[curPos] = 0;
+    typedef tuple<int, int> PQItem;
+    priority_queue<PQItem, vector<PQItem>, greater<PQItem>> pq;
+    pq.push(make_tuple(0, curPos));
+    vector<int> bestFU(N, 0);
+    while (!pq.empty()) {
+        auto top = pq.top(); pq.pop();
+        int cs = get<0>(top), u = get<1>(top);
+        if (cs > bestCost[u]) continue;
+        for (int d = 0; d < 6; d++) {
+            int nb = neighbor(u, d);
+            if (nb < 0 || nb >= N || g_cells[nb] == 3) continue;
+            auto cost = moveCost(u, traffic[u]);
+            int sc = cost.first, fc = cost.second;
+            if (sc < 0) continue;
+            if (isTanker) fc = 0;
+            int nxtS = cs + sc, nxtF = bestFU[u] + fc;
+            if (nxtS > stepsLeft) continue;
+            if (!isTanker && nxtF > fuelLeft) continue;
+            if (nxtS < bestCost[nb]) {
+                bestCost[nb] = nxtS; bestFU[nb] = nxtF;
+                pq.push(make_tuple(nxtS, nb));
+            }
+        }
+    }
+    vector<int> dSpot(N, INT_MAX);
+    queue<int> bfsQ;
+    for (auto& sp : g_spots) { dSpot[sp.pos] = 0; bfsQ.push(sp.pos); }
+    while (!bfsQ.empty()) {
+        int u = bfsQ.front(); bfsQ.pop();
+        for (int d = 0; d < 6; d++) {
+            int nb = neighbor(u, d);
+            if (nb < 0 || nb >= N || g_cells[nb] == 3) continue;
+            if (dSpot[nb] == INT_MAX) { dSpot[nb] = dSpot[u] + 1; bfsQ.push(nb); }
+        }
+    }
+    int bestPos = curPos, bestScore = INT_MIN;
+    for (int u = 0; u < N; u++) {
+        if (bestCost[u] == INT_MAX) continue;
+        int score = (g_cells[u] == 1 ? 0 : 100000)
+                  - dSpot[u] * 1000
+                  + (g_cells[u] == 0 ? 500 : 0)
+                  - bestCost[u] * 10;
+        if (score > bestScore) { bestScore = score; bestPos = u; }
+    }
+    return bestPos;
+}
+
+// ── SINH ACTIONS ĐẾN PARKING + WAIT CÒN LẠI ─────────────────────────────
+struct RepositionResult {
+    vector<int> actions; int finalPos; int stepsUsed; int fuelUsed;
+};
+static RepositionResult generateRepositionActions(
+    int curPos, int parkPos, int stepsLeft, int fuelLeft,
+    const vector<int>& traffic, bool isTanker)
+{
+    RepositionResult res; res.finalPos = curPos; res.stepsUsed = 0; res.fuelUsed = 0;
+    if (curPos == parkPos || stepsLeft <= 0) {
+        if (stepsLeft > 0) res.actions.push_back(-stepsLeft);
+        return res;
+    }
+    vector<int> path = bfsLightPath(curPos, parkPos);
+    if (path.empty()) { if (stepsLeft > 0) res.actions.push_back(-stepsLeft); return res; }
+    int pos = curPos, sBudget = stepsLeft, fBudget = fuelLeft;
+    for (int nxt : path) {
+        auto cost = moveCost(pos, traffic[pos]);
+        int sc = cost.first, fc = cost.second;
+        if (sc < 0) break;
+        if (isTanker) fc = 0;
+        if (sc > sBudget) break;
+        if (!isTanker && fc > fBudget) break;
+        int d = dirTo(pos, nxt); if (d < 0) break;
+        res.actions.push_back(d);
+        res.stepsUsed += sc; res.fuelUsed += fc;
+        sBudget -= sc; fBudget -= fc; pos = nxt;
+    }
+    res.finalPos = pos;
+    int wait = stepsLeft - res.stepsUsed;
+    if (wait > 0) res.actions.push_back(-wait);
+    return res;
 }
 
 // ── TÍNH TOÁN PHÂN VAI TRÒ DỰA TRÊN ĐỘ PHÂN TÁN KHÔNG GIAN ────────────
@@ -524,17 +639,19 @@ static vector<int> optimizeTour2OptExact(int startPos, int startFuel, int maxSte
 
     vector<int> tour = spotPositions;
     bool improved = true;
-    int maxIters = 12;
+    int maxIters = 6; // Giảm từ 12→6: tiết kiệm ~50% thời gian 2-Opt
 
     while (improved && maxIters-- > 0) {
         improved = false;
+        // Cache currentSim BÊN NGOÀI vòng lặp j — tránh gọi simulateTourExact lặp lại vô ích
+        auto currentSim = simulateTourExact(startPos, startFuel, maxStepsLimit, tour);
+        int currentArrivalScore = calcFirstArrivalScore(tour);
         for (size_t i = 0; i < tour.size() - 1; i++) {
             for (size_t j = i + 1; j < tour.size(); j++) {
                 vector<int> newTour = tour;
                 reverse(newTour.begin() + i, newTour.begin() + j + 1);
 
-                auto currentSim = simulateTourExact(startPos, startFuel, maxStepsLimit, tour);
-                auto newSim     = simulateTourExact(startPos, startFuel, maxStepsLimit, newTour);
+                auto newSim = simulateTourExact(startPos, startFuel, maxStepsLimit, newTour);
 
                 bool isBetter = false;
                 if (newSim.feasible) {
@@ -547,7 +664,8 @@ static vector<int> optimizeTour2OptExact(int startPos, int startFuel, int maxSte
                             isBetter = true;
                         } else if (newSim.totalFuel == currentSim.totalFuel) {
                             // TIE-BREAKER: Tối ưu hóa First-Arrival Time cho thương hiệu quý
-                            if (calcFirstArrivalScore(newTour) > calcFirstArrivalScore(tour)) {
+                            int newArrivalScore = calcFirstArrivalScore(newTour);
+                            if (newArrivalScore > currentArrivalScore) {
                                 isBetter = true;
                             }
                         }
@@ -556,6 +674,8 @@ static vector<int> optimizeTour2OptExact(int startPos, int startFuel, int maxSte
 
                 if (isBetter) {
                     tour = newTour;
+                    currentSim = newSim; // Cập nhật cache khi tour thay đổi
+                    currentArrivalScore = calcFirstArrivalScore(tour);
                     improved = true;
                 }
             }
@@ -692,12 +812,28 @@ static TimeWindowTankerSimResult simulateTankerTimeWindowTour(
 static vector<int> planSingleTankerRouteTimeWindow(
     int tPos, int daySteps,
     const vector<int>& traffic,
-    const vector<RendezvousEvent>& events) {
+    const vector<RendezvousEvent>& events,
+    bool isLastDay = false) {
 
-    if (events.empty()) return {-daySteps};
+    if (events.empty()) {
+        if (!isLastDay) {
+            // Tanker không có nhiệm vụ → reposition gần patrol cluster cho ngày mai
+            int parkPos = findBestParkingPos(tPos, daySteps, 999999, traffic, true);
+            auto repo = generateRepositionActions(tPos, parkPos, daySteps, 999999, traffic, true);
+            return repo.actions;
+        }
+        return {-daySteps};
+    }
 
     auto sim = simulateTankerTimeWindowTour(tPos, daySteps, events);
-    if (!sim.feasible || sim.optimizedSequence.empty()) return {-daySteps};
+    if (!sim.feasible || sim.optimizedSequence.empty()) {
+        if (!isLastDay) {
+            int parkPos = findBestParkingPos(tPos, daySteps, 999999, traffic, true);
+            auto repo = generateRepositionActions(tPos, parkPos, daySteps, 999999, traffic, true);
+            return repo.actions;
+        }
+        return {-daySteps};
+    }
 
     vector<int> actions;
     vector<int> tankerTimeline;
@@ -745,8 +881,30 @@ static vector<int> planSingleTankerRouteTimeWindow(
 
     int rest = daySteps - curTime;
     if (rest > 0) {
-        actions.push_back(-rest);
-        for (int s = 0; s < rest; s++) tankerTimeline.push_back(curPos);
+        if (!isLastDay) {
+            // ── TANKER REPOSITION: Tránh đỗ trên đường + gần cluster patrol ──
+            int parkPos = findBestParkingPos(curPos, rest, 999999, traffic, true);
+            auto repo = generateRepositionActions(curPos, parkPos, rest, 999999, traffic, true);
+            for (int a : repo.actions) actions.push_back(a);
+            // Update timeline
+            int tpPos = curPos;
+            for (int a : repo.actions) {
+                if (a >= 0) {
+                    int nxt = neighbor(tpPos, a);
+                    if (nxt >= 0) {
+                        auto mc = moveCost(tpPos, traffic[tpPos]);
+                        for (int s = 0; s < mc.first; s++) tankerTimeline.push_back(nxt);
+                        tpPos = nxt;
+                    }
+                } else {
+                    int w = -a;
+                    for (int s = 0; s < w; s++) tankerTimeline.push_back(tpPos);
+                }
+            }
+        } else {
+            actions.push_back(-rest);
+            for (int s = 0; s < rest; s++) tankerTimeline.push_back(curPos);
+        }
     }
 
     return actions;
@@ -1004,7 +1162,8 @@ static string planActions(const mj::Value& m) {
     allKeyNodes.erase(unique(allKeyNodes.begin(), allKeyNodes.end()), allKeyNodes.end());
 
     for (int src : allKeyNodes) {
-        MultiLabelDijkResult d = dijkstraMultiLabel(src, 9999, g_maxFuel, traffic, false);
+        // Giới hạn maxSteps = daySteps (thay vì 9999) vì không cần tìm đường xa hơn 1 ngày
+        MultiLabelDijkResult d = dijkstraMultiLabel(src, daySteps, g_maxFuel, traffic, false);
         for (int dst : allKeyNodes) {
             buildParetoFrontierFromMultiLabel(src, dst, d);
         }
@@ -1097,8 +1256,8 @@ static string planActions(const mj::Value& m) {
 
     for (;;) {
         auto curNow = chrono::high_resolution_clock::now();
-        if (chrono::duration<double, milli>(curNow - startTime).count() > 1500.0) {
-            break; // Chrono Watchdog: Đảm bảo phản hồi luôn dưới 1.8 giây, an toàn tuyệt đối dưới mốc 15s của BTC!
+        if (chrono::duration<double, milli>(curNow - startTime).count() > 500.0) {
+            break; // Chrono Watchdog: Giảm từ 1500→500ms để giữ response time thấp (Early Submit đã gửi Phase 1 trước rồi)
         }
 
         int bestPatrol = -1;
@@ -1318,8 +1477,43 @@ static string planActions(const mj::Value& m) {
 
         int rest = daySteps - stepsUsed;
         if (rest > 0) {
-            allActions[pi].push_back(-rest);
-            for (int s = 0; s < rest; s++) patrolTimelines[p].push_back(curPos);
+            // ── CHIẾN THUẬT CUỐI NGÀY: REPOSITION THÔNG MINH ──────────────
+            // Thay vì đứng yên tại chỗ (gây tắc nghẽn nếu trên đường,
+            // lãng phí vị trí xa spot), di chuyển đến ô tối ưu cho ngày mai:
+            // P1: Tránh ô đường (không tự gây traffic ngày mai)
+            // P2: Gần spot nhất (head-start ngày mai)
+            // P3: Ưu tiên đồng bằng (rẻ fuel khi bắt đầu ngày mai)
+            if (!isLastDay) {
+                int parkPos = findBestParkingPos(curPos, rest, curFuel, traffic, false);
+                auto repo = generateRepositionActions(curPos, parkPos, rest, curFuel, traffic, false);
+                for (int a : repo.actions) allActions[pi].push_back(a);
+                // Update timeline
+                // Di chuyển: mỗi action direction -> cập nhật pos trong timeline
+                int tPos = curPos;
+                int tSteps = 0;
+                for (int a : repo.actions) {
+                    if (a >= 0) {
+                        int nxt = neighbor(tPos, a);
+                        if (nxt >= 0) {
+                            auto mc = moveCost(tPos, traffic[tPos]);
+                            for (int s = 0; s < mc.first; s++) patrolTimelines[p].push_back(nxt);
+                            tSteps += mc.first;
+                            tPos = nxt;
+                        }
+                    } else {
+                        int w = -a;
+                        for (int s = 0; s < w; s++) patrolTimelines[p].push_back(tPos);
+                        tSteps += w;
+                    }
+                }
+                curPos = repo.finalPos;
+                curFuel -= repo.fuelUsed;
+                actualPatrolEndFuel[p] = curFuel;
+            } else {
+                // Ngày cuối: không cần reposition, đứng yên
+                allActions[pi].push_back(-rest);
+                for (int s = 0; s < rest; s++) patrolTimelines[p].push_back(curPos);
+            }
         }
         endPos[pi] = curPos;
     }
@@ -1348,7 +1542,7 @@ static string planActions(const mj::Value& m) {
             : vector<RendezvousEvent>{};
 
         allActions[ti] = planSingleTankerRouteTimeWindow(
-            agents[ti].pos, daySteps, traffic, assignedEvents
+            agents[ti].pos, daySteps, traffic, assignedEvents, isLastDay
         );
     }
 
@@ -1692,11 +1886,11 @@ int main(int argc, char** argv) {
         return 1;
     }
     fprintf(stderr, "[ASSIGNED] %s\n", assignBody.c_str());
-    sleepMs(100); // Giữ khoảng cách 100ms sau assignment để xả sạch rate-limit bucket trước khi Day 0 bắt đầu
+    // Bỏ sleepMs(100) cũ: tiết kiệm 100ms mỗi trận, bắt đầu poll state ngay lập tức
 
     int lastDay = -1;
     for (;;) {
-        auto r = client.request("GET", "/state");
+        auto r = client.request("GET", "/state", "", 1000); // Giảm timeout GET từ 1500→1000ms
         if (r.status == 200) {
             auto v = mj::parse(r.body);
             int day = (*v)["day"].asInt();
@@ -1709,16 +1903,16 @@ int main(int argc, char** argv) {
 
                 string acts = planActions(*v);
 
-                // GỬI ACTIONS VỚI DEADLINE WATCHDOG & RAPID EMERGENCY FLUSH
+                // GỬI ACTIONS NHANH CHÓNG — giảm retry 12→6, giảm timeout 1500→1000ms
                 bool postSuccess = false;
-                int backoffMs = 80;
-                for (int retry = 0; retry < 12; retry++) {
+                int backoffMs = 60; // Giảm initial backoff từ 80→60ms
+                for (int retry = 0; retry < 6; retry++) {
                     auto now = chrono::steady_clock::now();
                     long long msLeft = chrono::duration_cast<chrono::milliseconds>(dayDeadline - now).count();
 
-                    // Nếu còn <= 1500ms trước deadline: KÍCH HOẠT RAPID FLUSH (timeout ngắn 800ms, retry dồn dập 40ms)
+                    // Nếu còn <= 1500ms trước deadline: KÍCH HOẠT RAPID FLUSH
                     bool isEmergency = (msLeft <= 1500);
-                    int reqTimeout = isEmergency ? 800 : 1500;
+                    int reqTimeout = isEmergency ? 600 : 1000; // Giảm timeout POST từ 1500/800→1000/600ms
 
                     auto pr = client.request("POST", "/actions", acts, reqTimeout);
                     if (pr.status == 200) {
@@ -1727,22 +1921,22 @@ int main(int argc, char** argv) {
                     }
 
                     if (isEmergency) {
-                        fprintf(stderr, "[EMERGENCY WATCHDOG] Day %d con lai %lldms! Rapid retry %d/12...\n", day, msLeft, retry + 1);
-                        sleepMs(40); // Bắn dồn dập cách nhau 40ms
+                        fprintf(stderr, "[EMERGENCY WATCHDOG] Day %d con lai %lldms! Rapid retry %d/6...\n", day, msLeft, retry + 1);
+                        sleepMs(30); // Giảm từ 40→30ms
                         continue;
                     }
 
                     if (pr.status == 429) {
-                        fprintf(stderr, "[RATE-LIMIT] POST /actions day %d -> HTTP 429, retry %d/12 sau %dms...\n", day, retry + 1, backoffMs);
+                        fprintf(stderr, "[RATE-LIMIT] POST /actions day %d -> HTTP 429, retry %d/6 sau %dms...\n", day, retry + 1, backoffMs);
                         sleepMs(backoffMs);
-                        backoffMs = min(1500, backoffMs * 2);
+                        backoffMs = min(800, backoffMs * 2); // Giảm max backoff từ 1500→800ms
                         continue;
                     }
 
                     fprintf(stderr, "[ERR] POST /actions day %d -> HTTP %d: %s\n",
                             day, pr.status, pr.body.c_str());
                     sleepMs(backoffMs);
-                    backoffMs = min(1500, backoffMs * 2);
+                    backoffMs = min(800, backoffMs * 2);
                 }
 
                 if (!postSuccess) {
@@ -1759,7 +1953,7 @@ int main(int argc, char** argv) {
                         }
                         safeOut << "]";
                         fprintf(stderr, "[SAFE FALLBACK] Ban goi hanh dong an toan de cuu diem Day %d!\n", day);
-                        auto pr = client.request("POST", "/actions", safeOut.str(), 600);
+                        auto pr = client.request("POST", "/actions", safeOut.str(), 500); // Giảm từ 600→500ms
                         if (pr.status == 200) postSuccess = true;
                     }
                 }
@@ -1767,11 +1961,11 @@ int main(int argc, char** argv) {
                 if (postSuccess) {
                     lastDay = day; // CHỈ KHÓA DAY KHI XÁC NHẬN SERVER ĐÃ NHẬN THÀNH CÔNG (HTTP 200)
                 } else {
-                    fprintf(stderr, "[WARN] POST /actions day %d chua thanh cong sau 12 lan thu, se retry o chu ky tiep theo...\n", day);
+                    fprintf(stderr, "[WARN] POST /actions day %d chua thanh cong sau 6 lan thu, se retry o chu ky tiep theo...\n", day);
                 }
             }
         } else if (r.status == 429) {
-            sleepMs(400); // Backoff nhanh nếu GET /state bị rate-limit
+            sleepMs(250); // Giảm backoff GET rate-limit từ 400→250ms
         } else if (r.status != 0) {
             auto rr = client.request("GET", "/result");
             if (rr.status == 200) {
